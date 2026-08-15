@@ -88,11 +88,37 @@ Instances run with `--permission-mode auto` and `--no-create-session-in-dir`.
 
 ### Paths
 
-The claude binary is looked up as `~/.claude/local/claude`, then `claude` on
+The claude binary is looked up as `~/.claude/local/claude`, then
+`~/.local/bin/claude` (the native installer's default), then `claude` on
 `PATH`, with `CLAUDE_BIN` as an override for anything unusual.
 
-Project directories are assumed to live under `~/projects`. That's a single
-hardcoded line at the top of `bin/claude-rc-window` if your layout differs.
+That last fallback is unreliable in practice: `systemd --user` units run with
+the manager's own minimal `PATH`, not your login shell's, so a `claude` that's
+only reachable via a customized shell `PATH` (nvm, a nonstandard prefix, etc.)
+resolves fine when you run `make check` interactively but still fails at
+runtime. If neither hardcoded path applies to your setup, set `CLAUDE_BIN`
+persistently for the user manager rather than relying on shell `PATH`:
+
+```sh
+mkdir -p ~/.config/environment.d
+echo 'CLAUDE_BIN=/path/to/claude' > ~/.config/environment.d/claude-rc.conf
+systemctl --user set-environment CLAUDE_BIN=/path/to/claude   # picks it up now, without a re-login
+```
+
+Project directories are assumed to live directly under `~/projects` — instance
+names map 1:1 to a single path segment (`claude-rc@foo` → `~/projects/foo`),
+and can't contain `/`: that's disallowed in systemd unit names outright, not
+just a limitation of this tool. If a project lives deeper (a monorepo
+checkout, say), symlink it into `~/projects` under a flat name and enable
+that:
+
+```sh
+ln -s ~/projects/mycompany/monorepo ~/projects/mycompany-monorepo
+make enable NAME=mycompany-monorepo
+```
+
+The `~/projects` prefix itself is assumed too, as a single hardcoded line at
+the top of `bin/claude-rc-window`, if your layout differs.
 
 The scripts are symlinked into `~/.local/bin` and the units into
 `~/.config/systemd/user`, both pointing back at this checkout — so `git pull`

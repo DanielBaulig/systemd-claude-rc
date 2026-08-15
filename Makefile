@@ -76,7 +76,10 @@ check:
 	if command -v tmux >/dev/null; then echo "  ok       tmux $$(tmux -V | cut -d' ' -f2)"; \
 	  else echo "  MISSING  tmux"; fail=1; fi; \
 	if [[ -x "$(HOME)/.claude/local/claude" ]]; then echo "  ok       claude (~/.claude/local/claude)"; \
-	  elif command -v claude >/dev/null; then echo "  ok       claude ($$(command -v claude))"; \
+	  elif [[ -x "$(HOME)/.local/bin/claude" ]]; then echo "  ok       claude (~/.local/bin/claude)"; \
+	  elif command -v claude >/dev/null; then echo "  ok       claude ($$(command -v claude)) -- only on your shell's PATH;" \
+	    "systemd --user units use a minimal PATH and won't find it there. Set CLAUDE_BIN" \
+	    "(see README) or symlink it into ~/.local/bin."; \
 	  else echo "  MISSING  claude -- install it and run 'claude' once to log in"; fail=1; fi; \
 	if [[ "$$(loginctl show-user "$$USER" -p Linger --value 2>/dev/null)" == "yes" ]]; then \
 	  echo "  ok       linger enabled"; else echo "  todo     linger off (make install turns it on)"; fi; \

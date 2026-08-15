@@ -19,14 +19,21 @@ name="${1:?usage: claude-rc-window <name>}"
 dir="$HOME/projects/$name"
 session="crc"
 
-# Resolve the claude binary: the local-installer path, then PATH, with
-# CLAUDE_BIN as an escape hatch. Machines using the native installer don't
-# have ~/.claude/local/claude at all. Resolved to an absolute path because
-# the command ends up in a tmux pane, not this shell.
+# Resolve the claude binary: the migrated-installer path, then the native
+# installer's, then PATH, with CLAUDE_BIN as an escape hatch. Resolved to an
+# absolute path because the command ends up in a tmux pane, not this shell.
+# The PATH fallback is unreliable here: systemd --user units run with the
+# manager's own minimal PATH, not your login shell's, so a claude that's only
+# reachable via a customized shell PATH (nvm, a nonstandard prefix, etc.)
+# will resolve when you run `make check` interactively but still fail at
+# runtime. If neither hardcoded path applies, set CLAUDE_BIN persistently in
+# ~/.config/environment.d/ (see README).
 claude_bin="${CLAUDE_BIN:-}"
 if [[ -z "$claude_bin" ]]; then
   if [[ -x "$HOME/.claude/local/claude" ]]; then
     claude_bin="$HOME/.claude/local/claude"
+  elif [[ -x "$HOME/.local/bin/claude" ]]; then
+    claude_bin="$HOME/.local/bin/claude"
   else
     claude_bin="$(command -v claude || true)"
   fi
@@ -41,7 +48,7 @@ if [[ ! -d "$dir" ]]; then
 fi
 
 if [[ -z "$claude_bin" ]]; then
-  echo "claude-rc-window: no claude binary found (tried ~/.claude/local/claude and PATH; set CLAUDE_BIN to override)" >&2
+  echo "claude-rc-window: no claude binary found (tried ~/.claude/local/claude, ~/.local/bin/claude, and PATH; set CLAUDE_BIN to override)" >&2
   exit 1
 fi
 
