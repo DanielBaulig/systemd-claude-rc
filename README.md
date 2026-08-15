@@ -4,13 +4,13 @@ Run [Claude Code](https://claude.ai/code) Remote Control (`claude rc`) instances
 as user-level systemd services, each in its own window of a shared `tmux`
 session, started at boot and respawned when they die.
 
-One instance per project. The instance name maps to a directory by convention:
-`claude-rc@esplink` runs in `~/projects/esplink`.
+One instance per project, named after the project's directory under
+`~/projects`: `claude-rc@myproject` runs `claude rc` in `~/projects/myproject`.
 
 ```
 $ systemctl --user list-units 'claude-rc*'
-claude-rc@copa-alert.service   loaded active exited   claude rc window for copa-alert
-claude-rc@esplink.service      loaded active exited   claude rc window for esplink
+claude-rc@myproject.service    loaded active exited   claude rc window for myproject
+claude-rc@otherproject.service loaded active exited   claude rc window for otherproject
 claude-rc.target               loaded active active   All claude rc instances
 claude-rc-healthcheck.timer    loaded active waiting  Periodically respawn dead windows
 
@@ -21,11 +21,14 @@ $ tmux attach -t crc
 
 Needs `tmux`, `claude`, and a systemd user manager (any modern Linux).
 
+Clone it wherever you keep checkouts — the install symlinks back to it, so
+pick somewhere permanent.
+
 ```sh
-git clone https://github.com/DanielBaulig/systemd-claude-rc ~/projects/systemd-claude-rc
-cd ~/projects/systemd-claude-rc
+git clone https://github.com/DanielBaulig/systemd-claude-rc
+cd systemd-claude-rc
 make install
-make enable NAME=esplink      # for each ~/projects/<name> you want
+make enable NAME=<project>     # once per ~/projects/<project> you want running
 ```
 
 `make install` symlinks the scripts and units into place, enables lingering,
@@ -47,8 +50,8 @@ Two things it can't do for you:
 | | |
 |---|---|
 | `make install` | Symlink everything, enable linger, start the target |
-| `make enable NAME=foo` | Enable + start an instance for `~/projects/foo` |
-| `make disable NAME=foo` | Stop + disable it |
+| `make enable NAME=<project>` | Enable + start an instance for `~/projects/<project>` |
+| `make disable NAME=<project>` | Stop + disable it |
 | `make status` | The target, the timer, and every instance |
 | `make check` | Preflight: tmux, claude, linger |
 | `make relink` | Refresh symlinks and `daemon-reload` (after a `git pull`) |
@@ -85,8 +88,11 @@ Instances run with `--permission-mode auto` and `--no-create-session-in-dir`.
 
 ### Paths
 
-`~/.claude/local/claude` is preferred, falling back to `claude` on `PATH`, with
-`CLAUDE_BIN` as an override for anything unusual.
+The claude binary is looked up as `~/.claude/local/claude`, then `claude` on
+`PATH`, with `CLAUDE_BIN` as an override for anything unusual.
+
+Project directories are assumed to live under `~/projects`. That's a single
+hardcoded line at the top of `bin/claude-rc-window` if your layout differs.
 
 The scripts are symlinked into `~/.local/bin` and the units into
 `~/.config/systemd/user`, both pointing back at this checkout — so `git pull`
@@ -96,9 +102,9 @@ changing a unit file, run `make relink`.
 ## Troubleshooting
 
 ```sh
-systemctl --user status claude-rc@esplink.service   # what systemd thinks
-journalctl --user -u claude-rc@esplink.service      # script output
-tmux attach -t crc                                  # what actually happened
+systemctl --user status claude-rc@<project>.service   # what systemd thinks
+journalctl --user -u claude-rc@<project>.service      # script output
+tmux attach -t crc                                    # what actually happened
 ```
 
 A window that dies instantly is almost always `claude` not being logged in on

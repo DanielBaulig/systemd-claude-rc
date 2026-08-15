@@ -3,7 +3,7 @@ Description=claude rc (Remote Control) window for %i
 Documentation=https://claude.ai/code
 PartOf=claude-rc.target
 # Directory convention: instance name %i maps to ~/projects/%i
-# (e.g. `claude-rc@esplink` -> ~/projects/esplink).
+# (e.g. `claude-rc@myproject` -> ~/projects/myproject).
 
 [Service]
 Type=oneshot
