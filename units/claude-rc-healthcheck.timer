@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically respawn any dead claude rc tmux windows
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=claude-rc-healthcheck.service
+
+[Install]
+WantedBy=timers.target

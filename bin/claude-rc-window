@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# claude-rc-window <name>
+#
+# Idempotently ensure a `claude rc` (Remote Control) instance for project
+# ~/projects/<name> is running in its own window inside the shared "crc"
+# tmux session. Safe to re-run: does nothing if the window is already
+# alive, respawns it in place if it died, creates it (and the session,
+# if needed) if it doesn't exist yet.
+#
+# Used as ExecStart/ExecReload for the claude-rc@.service systemd template.
+set -euo pipefail
+
+name="${1:?usage: claude-rc-window <name>}"
+[[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || {
+  echo "claude-rc-window: invalid instance name: $name" >&2
+  exit 1
+}
+
+dir="$HOME/projects/$name"
+session="crc"
+
+# Resolve the claude binary: the local-installer path, then PATH, with
+# CLAUDE_BIN as an escape hatch. Machines using the native installer don't
+# have ~/.claude/local/claude at all. Resolved to an absolute path because
+# the command ends up in a tmux pane, not this shell.
+claude_bin="${CLAUDE_BIN:-}"
+if [[ -z "$claude_bin" ]]; then
+  if [[ -x "$HOME/.claude/local/claude" ]]; then
+    claude_bin="$HOME/.claude/local/claude"
+  else
+    claude_bin="$(command -v claude || true)"
+  fi
+fi
+
+# --permission-mode applies to every session this instance spawns.
+cmd="'$claude_bin' rc --name '$name' --no-create-session-in-dir --permission-mode auto"
+
+if [[ ! -d "$dir" ]]; then
+  echo "claude-rc-window: no such directory: $dir" >&2
+  exit 1
+fi
+
+if [[ -z "$claude_bin" ]]; then
+  echo "claude-rc-window: no claude binary found (tried ~/.claude/local/claude and PATH; set CLAUDE_BIN to override)" >&2
+  exit 1
+fi
+
+if [[ ! -x "$claude_bin" ]]; then
+  echo "claude-rc-window: claude binary not executable: $claude_bin" >&2
+  exit 1
+fi
+
+if ! tmux has-session -t "=$session" 2>/dev/null; then
+  tmux new-session -d -s "$session" -n "$name" -c "$dir" "$cmd"
+  # Keep crashed windows around (instead of vanishing) so failures are
+  # visible when someone attaches, and so respawn-window has a target.
+  tmux set-option -t "$session" remain-on-exit on
+  exit 0
+fi
+
+if tmux list-windows -t "$session" -F '#{window_name}' | grep -qx "$name"; then
+  if [[ "$(tmux display-message -p -t "$session:$name" '#{pane_dead}')" == "1" ]]; then
+    tmux respawn-window -k -t "$session:$name" "$cmd"
+  fi
+  exit 0
+fi
+
+tmux new-window -t "$session:" -n "$name" -c "$dir" "$cmd"

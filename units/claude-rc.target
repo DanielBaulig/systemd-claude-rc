@@ -1,0 +1,8 @@
+[Unit]
+Description=All claude rc (Remote Control) instances
+# Pulled in at boot via lingering; instances opt in individually with
+# `systemctl --user enable --now claude-rc@<name>.service`, which adds
+# them as a Wants= dependency of this target.
+
+[Install]
+WantedBy=default.target

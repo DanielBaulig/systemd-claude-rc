@@ -1,0 +1,16 @@
+[Unit]
+Description=claude rc (Remote Control) window for %i
+Documentation=https://claude.ai/code
+PartOf=claude-rc.target
+# Directory convention: instance name %i maps to ~/projects/%i
+# (e.g. `claude-rc@esplink` -> ~/projects/esplink).
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/claude-rc-window %i
+ExecReload=%h/.local/bin/claude-rc-window %i
+ExecStop=%h/.local/bin/claude-rc-window-stop %i
+
+[Install]
+WantedBy=claude-rc.target

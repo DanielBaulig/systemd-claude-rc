@@ -1,0 +1,7 @@
+[Unit]
+Description=Respawn any dead claude rc tmux windows
+PartOf=claude-rc.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-rc-healthcheck
