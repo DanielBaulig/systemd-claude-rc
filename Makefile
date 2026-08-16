@@ -1,22 +1,29 @@
 SHELL := /bin/bash
 
-REPO      := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
-BIN_DIR   := $(HOME)/.local/bin
-UNIT_DIR  := $(HOME)/.config/systemd/user
+REPO         := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+BIN_DIR      := $(HOME)/.local/bin
+UNIT_DIR     := $(HOME)/.config/systemd/user
+# Mirrors bin/claude-rc-window's own default so `make enable`'s directory
+# check agrees with what the running instance will actually use.
+PROJECTS_DIR := $(if $(CLAUDE_RC_PROJECTS_DIR),$(CLAUDE_RC_PROJECTS_DIR),$(HOME)/projects)
+# Reserved instance name for claude-rc-general.service; see bin/claude-rc-window.
+GENERAL_NAME := general
 
 SCRIPTS   := $(notdir $(wildcard $(REPO)/bin/*))
 UNITS     := $(notdir $(wildcard $(REPO)/units/*))
 
-.PHONY: help install uninstall enable disable check status link relink
+.PHONY: help install uninstall enable disable enable-general disable-general check status link relink
 
 help:
 	@echo "claude-rc -- systemd-managed 'claude rc' windows in a shared tmux session"
 	@echo
 	@echo "  make install           Symlink scripts + units, enable linger, start the target"
-	@echo "  make enable NAME=foo   Enable and start an instance for ~/projects/foo"
+	@echo "  make enable NAME=foo   Enable and start an instance for \$$PROJECTS_DIR/foo"
 	@echo "  make disable NAME=foo  Stop and disable that instance"
+	@echo "  make enable-general    Enable and start the instance for the projects root itself"
+	@echo "  make disable-general   Stop and disable it"
 	@echo "  make status            Show the target, the timer and every instance"
-	@echo "  make check             Preflight: tmux, claude, linger"
+	@echo "  make check             Preflight: tmux, projects dir, claude, linger"
 	@echo "  make uninstall         Remove symlinks (leaves ~/projects and the repo alone)"
 	@echo
 	@echo "Instances are tracked by systemd itself, in"
@@ -64,17 +71,26 @@ install: check link
 
 enable:
 	@[[ -n "$(NAME)" ]] || { echo "usage: make enable NAME=<project>" >&2; exit 1; }
-	@[[ -d "$(HOME)/projects/$(NAME)" ]] || { echo "no such project: $(HOME)/projects/$(NAME)" >&2; exit 1; }
+	@[[ "$(NAME)" != "$(GENERAL_NAME)" ]] || { echo "NAME=$(GENERAL_NAME) is reserved for the projects-root instance; use 'make enable-general'" >&2; exit 1; }
+	@[[ -d "$(PROJECTS_DIR)/$(NAME)" ]] || { echo "no such project: $(PROJECTS_DIR)/$(NAME)" >&2; exit 1; }
 	systemctl --user enable --now "claude-rc@$(NAME).service"
 
 disable:
 	@[[ -n "$(NAME)" ]] || { echo "usage: make disable NAME=<project>" >&2; exit 1; }
 	systemctl --user disable --now "claude-rc@$(NAME).service"
 
+enable-general:
+	systemctl --user enable --now claude-rc-general.service
+
+disable-general:
+	systemctl --user disable --now claude-rc-general.service
+
 check:
 	@fail=0; \
 	if command -v tmux >/dev/null; then echo "  ok       tmux $$(tmux -V | cut -d' ' -f2)"; \
 	  else echo "  MISSING  tmux"; fail=1; fi; \
+	if [[ -d "$(PROJECTS_DIR)" ]]; then echo "  ok       projects dir ($(PROJECTS_DIR))"; \
+	  else echo "  MISSING  projects dir ($(PROJECTS_DIR))"; fail=1; fi; \
 	if [[ -x "$(HOME)/.claude/local/claude" ]]; then echo "  ok       claude (~/.claude/local/claude)"; \
 	  elif [[ -x "$(HOME)/.local/bin/claude" ]]; then echo "  ok       claude (~/.local/bin/claude)"; \
 	  elif command -v claude >/dev/null; then echo "  ok       claude ($$(command -v claude)) -- only on your shell's PATH;" \
