@@ -4,13 +4,18 @@ Run [Claude Code](https://claude.ai/code) Remote Control (`claude rc`) instances
 as user-level systemd services, each in its own window of a shared `tmux`
 session, started at boot and respawned when they die.
 
-One instance per project, named after the project's directory under
-`~/projects`: `claude-rc@myproject` runs `claude rc` in `~/projects/myproject`.
+One instance per project, named after the project's directory under the
+projects root (`~/projects` by default, configurable — see
+[Paths](#paths)): `claude-rc@myproject` runs `claude rc` in
+`<projects-dir>/myproject`. A separate, non-templated instance,
+`claude-rc-general.service`, runs `claude rc` in the projects root itself,
+for work that doesn't belong to any one project.
 
 ```
 $ systemctl --user list-units 'claude-rc*'
 claude-rc@myproject.service    loaded active exited   claude rc window for myproject
 claude-rc@otherproject.service loaded active exited   claude rc window for otherproject
+claude-rc-general.service      loaded active exited   claude rc window for the projects root
 claude-rc.target               loaded active active   All claude rc instances
 claude-rc-healthcheck.timer    loaded active waiting  Periodically respawn dead windows
 
@@ -28,7 +33,8 @@ pick somewhere permanent.
 git clone https://github.com/DanielBaulig/systemd-claude-rc
 cd systemd-claude-rc
 make install
-make enable NAME=<project>     # once per ~/projects/<project> you want running
+make enable NAME=<project>     # once per <projects-dir>/<project> you want running
+make enable-general            # optional: one instance for the projects root itself
 ```
 
 `make install` symlinks the scripts and units into place, enables lingering,
@@ -50,10 +56,12 @@ Two things it can't do for you:
 | | |
 |---|---|
 | `make install` | Symlink everything, enable linger, start the target |
-| `make enable NAME=<project>` | Enable + start an instance for `~/projects/<project>` |
+| `make enable NAME=<project>` | Enable + start an instance for `<projects-dir>/<project>` |
 | `make disable NAME=<project>` | Stop + disable it |
+| `make enable-general` | Enable + start the instance for the projects root itself |
+| `make disable-general` | Stop + disable it |
 | `make status` | The target, the timer, and every instance |
-| `make check` | Preflight: tmux, claude, linger |
+| `make check` | Preflight: tmux, projects dir, claude, linger |
 | `make relink` | Refresh symlinks and `daemon-reload` (after a `git pull`) |
 | `make uninstall` | Remove the symlinks |
 
@@ -65,18 +73,21 @@ already reads that directory directly.
 ## How it works
 
 `claude-rc@.service` is a `Type=oneshot` template with `RemainAfterExit=yes`.
-It doesn't hold the process — it calls three scripts:
+`claude-rc-general.service` is the same shape but not templated — there's only
+one projects root. Neither holds the process — they call three scripts:
 
-- **`claude-rc-window <name>`** (`ExecStart`/`ExecReload`) idempotently ensures
-  the window exists: creates the `crc` session if needed, respawns the window
-  in place if the pane died, does nothing if it's healthy.
+- **`claude-rc-window <name>|--general`** (`ExecStart`/`ExecReload`)
+  idempotently ensures the window exists: creates the `crc` session if needed,
+  respawns the window in place if the pane died, does nothing if it's healthy.
+  `--general` is the projects-root instance: window name `general`, working
+  directory the projects root itself rather than a subfolder of it.
 - **`claude-rc-window-stop <name>`** (`ExecStop`) sends `SIGTERM` to the pane's
   process and waits up to 5s. `claude rc` treats that as a clean-shutdown
   request and closes its own tmux window on the way out — unlike the `SIGHUP`
   from `tmux kill-window`, which just leaves a dead pane behind. Forced
   `kill-window` only as a fallback.
 - **`claude-rc-healthcheck`** re-runs `claude-rc-window` for every enabled
-  instance, on a 5-minute timer.
+  instance, including the general one if enabled, on a 5-minute timer.
 
 The healthcheck exists because oneshot means systemd isn't supervising the
 window: nothing would notice a crash, an OOM kill, or a `claude update`
@@ -105,20 +116,35 @@ echo 'CLAUDE_BIN=/path/to/claude' > ~/.config/environment.d/claude-rc.conf
 systemctl --user set-environment CLAUDE_BIN=/path/to/claude   # picks it up now, without a re-login
 ```
 
-Project directories are assumed to live directly under `~/projects` — instance
-names map 1:1 to a single path segment (`claude-rc@foo` → `~/projects/foo`),
-and can't contain `/`: that's disallowed in systemd unit names outright, not
-just a limitation of this tool. If a project lives deeper (a monorepo
-checkout, say), symlink it into `~/projects` under a flat name and enable
-that:
+Project directories are assumed to live directly under a projects root,
+`~/projects` by default — instance names map 1:1 to a single path segment
+(`claude-rc@foo` → `<projects-dir>/foo`), and can't contain `/`: that's
+disallowed in systemd unit names outright, not just a limitation of this tool.
+If a project lives deeper (a monorepo checkout, say), symlink it into the
+projects root under a flat name and enable that:
 
 ```sh
 ln -s ~/projects/mycompany/monorepo ~/projects/mycompany-monorepo
 make enable NAME=mycompany-monorepo
 ```
 
-The `~/projects` prefix itself is assumed too, as a single hardcoded line at
-the top of `bin/claude-rc-window`, if your layout differs.
+The projects root is `CLAUDE_RC_PROJECTS_DIR`, read by `bin/claude-rc-window`
+and defaulting to `~/projects` if unset. Same caveat as `CLAUDE_BIN` above —
+set it persistently for the user manager, not just your shell:
+
+```sh
+mkdir -p ~/.config/environment.d
+echo 'CLAUDE_RC_PROJECTS_DIR=/path/to/projects' > ~/.config/environment.d/claude-rc.conf
+systemctl --user set-environment CLAUDE_RC_PROJECTS_DIR=/path/to/projects   # picks it up now, without a re-login
+```
+
+`make enable`/`make check` read the same variable (falling back to the same
+default) so the directory checks they do agree with what the instance will
+actually use.
+
+`general` is reserved as an instance name — `make enable NAME=general` is
+rejected — because `claude-rc-general.service` already runs a window named
+`general` for the projects root itself; see [above](#install).
 
 The scripts are symlinked into `~/.local/bin` and the units into
 `~/.config/systemd/user`, both pointing back at this checkout — so `git pull`
@@ -134,7 +160,7 @@ tmux attach -t crc                                    # what actually happened
 ```
 
 A window that dies instantly is almost always `claude` not being logged in on
-this machine, or `~/projects/<name>` not existing.
+this machine, or `<projects-dir>/<name>` not existing.
 
 Re-running `claude-rc-window` by hand is safe at any time — that's the whole
 design. `systemctl --user reload claude-rc@<name>.service` does the same thing

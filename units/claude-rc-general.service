@@ -1,0 +1,16 @@
+[Unit]
+Description=claude rc (Remote Control) window for the projects root
+Documentation=https://claude.ai/code
+PartOf=claude-rc.target
+# Not templated like claude-rc@.service: there's exactly one of these, and
+# it runs in the projects root itself rather than a subfolder of it.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/claude-rc-window --general
+ExecReload=%h/.local/bin/claude-rc-window --general
+ExecStop=%h/.local/bin/claude-rc-window-stop general
+
+[Install]
+WantedBy=claude-rc.target
