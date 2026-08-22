@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily reclaim of node_modules from dangling claude rc worktrees
+
+[Timer]
+OnCalendar=daily
+# Nothing here is urgent; let systemd batch it with other wakeups.
+AccuracySec=1h
+# Catch up after the machine has been off, rather than skipping the day.
+Persistent=true
+Unit=claude-rc-reap-node-modules.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Reclaim node_modules from dangling claude rc worktrees
+Documentation=https://code.claude.com/docs/en/worktrees
+PartOf=claude-rc.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-rc-reap-node-modules --apply --days 7
+# Deleting gigabytes should never compete with a running agent for IO.
+Nice=19
+IOSchedulingClass=idle
