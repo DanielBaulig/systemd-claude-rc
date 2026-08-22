@@ -1,0 +1,16 @@
+[Unit]
+Description=Resource limits shared by every claude rc instance
+Documentation=https://code.claude.com/docs/en/remote-control
+
+[Slice]
+# A single agent process reached 13.2G on this host in August 2026 and took
+# the whole machine's memory with it. Nothing capped it: neither the servers
+# nor the scopes they ran in had a limit, so the kernel's only option was a
+# global OOM kill. These numbers keep that inside the slice.
+#
+# A server with one live session measures ~306M. The ceiling is therefore far
+# above normal use and is aimed only at runaway growth. Raise both if you
+# genuinely run many concurrent sessions per instance.
+MemoryAccounting=yes
+MemoryHigh=8G
+MemoryMax=10G

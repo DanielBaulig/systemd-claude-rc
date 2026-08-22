@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# claude-rc-serve <name>|--general
+#
+# exec into `claude remote-control` for one instance. This is the ExecStart of
+# claude-rc@.service and claude-rc-general.service: it resolves the directory
+# and the claude binary, then replaces itself with the server so systemd's
+# Type=exec supervises the real process rather than a launcher that exits.
+#
+# It deliberately does not daemonise, background, or wrap in a multiplexer.
+# Anything that hands the server off to another process -- tmux included --
+# moves it out of the unit's cgroup, which is what left the old units unable
+# to notice their own instance dying.
+set -euo pipefail
+
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+
+if [[ "${1:-}" == "--general" ]]; then
+  name="general"
+  dir="$projects_dir"
+else
+  name="${1:?usage: claude-rc-serve <name>|--general}"
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || {
+    echo "claude-rc-serve: invalid instance name: $name" >&2; exit 1; }
+  dir="$projects_dir/$name"
+fi
+
+[[ -d "$dir" ]] || { echo "claude-rc-serve: no such directory: $dir" >&2; exit 1; }
+
+# Same resolution order as the old launcher, and the same reasoning: systemd
+# --user units run with the manager's minimal PATH, not your login shell's, so
+# a claude reachable only through a customised shell PATH resolves under
+# `make check` and still fails at runtime. Set CLAUDE_BIN in
+# ~/.config/environment.d/ if neither hardcoded path applies.
+claude_bin="${CLAUDE_BIN:-}"
+if [[ -z "$claude_bin" ]]; then
+  if [[ -x "$HOME/.claude/local/claude" ]]; then
+    claude_bin="$HOME/.claude/local/claude"
+  elif [[ -x "$HOME/.local/bin/claude" ]]; then
+    claude_bin="$HOME/.local/bin/claude"
+  else
+    claude_bin="$(command -v claude || true)"
+  fi
+fi
+[[ -n "$claude_bin" ]] || {
+  echo "claude-rc-serve: no claude binary found (tried ~/.claude/local/claude, ~/.local/bin/claude, and PATH; set CLAUDE_BIN to override)" >&2
+  exit 1; }
+[[ -x "$claude_bin" ]] || {
+  echo "claude-rc-serve: claude binary not executable: $claude_bin" >&2; exit 1; }
+
+args=(remote-control --name "$name"
+      --permission-mode "${CLAUDE_RC_PERMISSION_MODE:-auto}")
+
+# The old launcher passed --no-create-session-in-dir. That flag is the
+# documented opt-out from resumability: a server started with it archives its
+# sessions on stop, so nothing survives a restart to be brought back. Dropping
+# it costs one pre-created session per instance in the session list and buys
+# back recovery across clean restarts. Set CLAUDE_RC_NO_SESSION_IN_DIR=1 to
+# return to the old behaviour.
+[[ "${CLAUDE_RC_NO_SESSION_IN_DIR:-0}" == "1" ]] && args+=(--no-create-session-in-dir)
+
+cd "$dir"
+exec "$claude_bin" "${args[@]}"

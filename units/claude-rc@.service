@@ -1,16 +1,37 @@
 [Unit]
-Description=claude rc (Remote Control) window for %i
-Documentation=https://claude.ai/code
+Description=claude rc (Remote Control) server for %i
+Documentation=https://code.claude.com/docs/en/remote-control
 PartOf=claude-rc.target
-# Directory convention: instance name %i maps to ~/projects/%i
-# (e.g. `claude-rc@myproject` -> ~/projects/myproject).
+# Restart freely, but stop after five failures in five minutes rather than
+# looping forever: a server that cannot start needs a person, and a unit left
+# in 'failed' is how you find out.
+StartLimitIntervalSec=5min
+StartLimitBurst=5
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=%h/.local/bin/claude-rc-window %i
-ExecReload=%h/.local/bin/claude-rc-window %i
-ExecStop=%h/.local/bin/claude-rc-window-stop %i
+# Type=exec, so the unit is active exactly as long as the server process is.
+# The previous Type=oneshot units launched a tmux window and exited, which put
+# the server in tmux's cgroup instead of the unit's -- systemd then reported
+# them healthy for three days after the instance they started had been killed.
+Type=exec
+Slice=claude-rc.slice
+ExecStartPre=-/usr/bin/mkdir -p %h/.claude/rc-logs
+ExecStart=%h/.local/bin/claude-rc-serve %i
+Restart=on-failure
+RestartSec=10s
+
+# One agent dying must not take its siblings with it. systemd's default here
+# is 'stop', which is what turned a single OOM kill into the loss of every
+# session the server was hosting.
+OOMPolicy=continue
+MemoryHigh=3G
+MemoryMax=6G
+
+# The server redraws its status line about twice a second. That belongs in a
+# file you can tail, not in the journal, where it would bury everything else;
+# truncate: keeps it to one run's worth. Real errors still go to the journal.
+StandardOutput=truncate:%h/.claude/rc-logs/rc-%i.out
+StandardError=journal
 
 [Install]
 WantedBy=claude-rc.target
