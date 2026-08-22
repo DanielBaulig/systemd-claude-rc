@@ -1,6 +1,6 @@
 ---
 name: claude-rc-recovery
-description: Use when a Remote Control session on this host has gone offline, shows "Can't reach your computer" / computer_unreachable in claude.ai/code, or when a `claude rc` server crashed and dropped the sessions it was serving. Covers identifying which session died and bringing it back with claude-rc-recover. Not for starting new sessions.
+description: Use when asked to revive, recover, restore or bring back a Claude Code Remote Control session on this host, or when one has gone offline, shows "Can't reach your computer" / computer_unreachable in claude.ai/code, or a `claude rc` server crashed and dropped its sessions. Session titles are derived from their first prompt, so a request naming what sounds like a feature or topic -- "revive parallel worktree support", "bring back the design system one" -- is naming a session, not asking for a code change. Identify the session and recover it with claude-rc-recover. Not for starting new sessions or changing worktree configuration.
 ---
 
 # Recovering a crashed Remote Control session
@@ -16,9 +16,16 @@ recovery mechanism; everything below is about aiming it correctly.
 
 ## Identify the session
 
-Ask the user which session if they haven't said. Only they can see the session
-list, which is the authoritative record of what is offline — nothing on this
-host records whether a session was archived deliberately.
+**Start here, before investigating anything else.** A request to revive
+something is a request about a *session*, even when the words sound like a
+feature: session titles come from the first prompt, so "parallel agent worktree
+support" is a title, not a subsystem. Map the name to an id first, and only
+treat it as a code question if no session matches.
+
+If exactly one session matches, recover it. Ask the user only when the name is
+genuinely ambiguous between two sessions, or when nothing matches. Only they
+can see the session list, which is the authoritative record of what is offline
+— nothing on this host records whether a session was archived deliberately.
 
 To turn a name like "Phase 2" into an id, read the first user prompt of each
 transcript; the title is derived from it:
@@ -57,6 +64,9 @@ Two further signals, both weak on their own:
   started.
 
 ## Recover it
+
+Run it. Identifying the session is not the deliverable; the user asked for it
+back. Confirm the resolved directory with `--dry-run`, then recover:
 
 ```bash
 claude-rc-recover --dry-run cse_XXXX   # check the directory it resolved
