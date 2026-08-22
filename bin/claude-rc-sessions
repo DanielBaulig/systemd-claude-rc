@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# claude-rc-sessions
+#
+# List every Remote Control session this host has a transcript for, with the
+# title it shows in claude.ai/code and whether anything is serving it.
+#
+# Titles are derived from a session's first prompt, so this is how you turn
+# "the parallel worktree one" into an id you can pass to claude-rc-recover.
+set -uo pipefail
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+
+python3 - "$projects_dir" <<'PY'
+import glob, json, os, subprocess, sys
+
+projects = sys.argv[1]
+
+def first_prompt(d):
+    for f in sorted(glob.glob(os.path.join(d, '*.jsonl'))):
+        try: fh = open(f, errors='replace')
+        except OSError: continue
+        with fh:
+            for ln in fh:
+                if '"user"' not in ln: continue
+                try: o = json.loads(ln)
+                except Exception: continue
+                if o.get('type') != 'user': continue
+                c = (o.get('message') or {}).get('content')
+                if isinstance(c, list):
+                    c = ' '.join(b.get('text', '') for b in c
+                                 if isinstance(b, dict) and b.get('type') == 'text')
+                if isinstance(c, str):
+                    c = c.strip()
+                    # Skip tool results, task notifications and other machinery.
+                    if not c or c.startswith('<') or c.startswith('['):
+                        continue
+                    # Recovering a session compacts its transcript, which
+                    # replaces the original first prompt with this preamble --
+                    # so the title here would stop matching the one in the UI.
+                    if c.startswith('This session is being continued'):
+                        continue
+                    return ' '.join(c.split())[:58]
+    return ''
+
+def serving_pid(cse):
+    try:
+        out = subprocess.run(['pgrep', '-f', '--', f'--session-id {cse}'],
+                             capture_output=True, text=True).stdout.split()
+    except Exception:
+        return None
+    for pid in out:
+        try:
+            cmd = open(f'/proc/{pid}/cmdline','rb').read().replace(b'\0', b' ').decode()
+        except OSError:
+            continue
+        if 'claude.exe' in cmd or 'remote-control' in cmd or '/claude ' in cmd:
+            return pid
+    return None
+
+rows = []
+for d in sorted(glob.glob(os.path.expanduser('~/.claude/projects/*bridge-cse-*'))):
+    cse = 'cse_' + os.path.basename(d).split('bridge-cse-')[1]
+    wt = None
+    for cand in glob.glob(f'{projects}/*/.claude/worktrees/bridge-{cse}'):
+        wt = cand; break
+    pid = serving_pid(cse)
+
+    if pid:
+        try: cwd = os.readlink(f'/proc/{pid}/cwd')
+        except OSError: cwd = ''
+        # Served, but sitting somewhere other than its own worktree: the session
+        # is live yet detached from its work, and recovery will refuse to help
+        # until whatever is serving it is stopped.
+        status = 'SERVED' if (wt and cwd == wt) or not wt else 'MISBOUND'
+    elif wt:
+        status = 'OFFLINE'
+    else:
+        # Archiving a session removes its worktree; a transcript with none left
+        # was ended deliberately and needs nothing.
+        status = 'ARCHIVED'
+
+    branch = ''
+    if wt:
+        try:
+            branch = subprocess.run(['git','-C',wt,'rev-parse','--abbrev-ref','HEAD'],
+                                    capture_output=True, text=True).stdout.strip()
+        except Exception:
+            pass
+    rows.append((status, cse, first_prompt(d), branch, wt))
+
+order = {'MISBOUND':0, 'OFFLINE':1, 'SERVED':2, 'ARCHIVED':3}
+rows.sort(key=lambda r: (order.get(r[0], 9), r[1]))
+
+print(f"{'STATUS':<9} {'SESSION':<30} {'BRANCH':<26} TITLE")
+for status, cse, title, branch, wt in rows:
+    print(f"{status:<9} {cse:<30} {branch[:26]:<26} {title}")
+print()
+print("MISBOUND = live but not in its own worktree; stop its server, then claude-rc-recover")
+print("OFFLINE  = worktree exists, nothing serving it; claude-rc-recover <session>")
+print("ARCHIVED = worktree already removed; nothing to recover")
+PY
