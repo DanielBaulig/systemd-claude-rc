@@ -37,10 +37,10 @@ make enable NAME=<project>     # once per <projects-dir>/<project> you want runn
 make enable-general            # optional: one instance for the projects root itself
 ```
 
-`make install` symlinks the scripts and units into place, enables lingering,
-and starts the target and the healthcheck timer. It's idempotent — re-run it
-after a `git pull`, or use `make relink` to just refresh the symlinks and
-reload systemd.
+`make install` symlinks the scripts, units and skills into place, enables
+lingering, and starts the target, the healthcheck timer and the node_modules
+reaper timer. It's idempotent — re-run it after a `git pull`, or use
+`make relink` to just refresh the symlinks and reload systemd.
 
 Two things it can't do for you:
 
@@ -55,7 +55,7 @@ Two things it can't do for you:
 
 | | |
 |---|---|
-| `make install` | Symlink everything, enable linger, start the target |
+| `make install` | Symlink everything, enable linger, start the target and timers |
 | `make enable NAME=<project>` | Enable + start an instance for `<projects-dir>/<project>` |
 | `make disable NAME=<project>` | Stop + disable it |
 | `make enable-general` | Enable + start the instance for the projects root itself |
@@ -146,10 +146,13 @@ actually use.
 rejected — because `claude-rc-general.service` already runs a window named
 `general` for the projects root itself; see [above](#install).
 
-The scripts are symlinked into `~/.local/bin` and the units into
-`~/.config/systemd/user`, both pointing back at this checkout — so `git pull`
-is the deploy, and editing a script here is editing the deployed one. After
-changing a unit file, run `make relink`.
+The scripts are symlinked into `~/.local/bin`, the units into
+`~/.config/systemd/user`, and `skills/` into `$CLAUDE_RC_PROJECTS_DIR/.claude/skills`
+— all pointing back at this checkout, so `git pull` is the deploy and editing a
+script here is editing the deployed one. Skills land in the projects root rather
+than in any one repository so that the `general` instance, which serves that
+root, picks them up as project scope. After changing a unit file, run
+`make relink`.
 
 ## Troubleshooting
 

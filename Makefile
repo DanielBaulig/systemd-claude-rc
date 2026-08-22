@@ -11,18 +11,22 @@ GENERAL_NAME := general
 
 SCRIPTS   := $(notdir $(wildcard $(REPO)/bin/*))
 UNITS     := $(notdir $(wildcard $(REPO)/units/*))
+# Skills deploy into the projects root rather than into any one repository,
+# so the instance serving that root picks them up as project scope.
+SKILLS     := $(notdir $(wildcard $(REPO)/skills/*))
+SKILL_DIR  := $(PROJECTS_DIR)/.claude/skills
 
 .PHONY: help install uninstall enable disable enable-general disable-general check status link relink
 
 help:
 	@echo "claude-rc -- systemd-managed 'claude rc' windows in a shared tmux session"
 	@echo
-	@echo "  make install           Symlink scripts + units, enable linger, start the target"
+	@echo "  make install           Symlink scripts, units + skills, enable linger, start it all"
 	@echo "  make enable NAME=foo   Enable and start an instance for \$$PROJECTS_DIR/foo"
 	@echo "  make disable NAME=foo  Stop and disable that instance"
 	@echo "  make enable-general    Enable and start the instance for the projects root itself"
 	@echo "  make disable-general   Stop and disable it"
-	@echo "  make status            Show the target, the timer and every instance"
+	@echo "  make status            Show the target, the timers and every instance"
 	@echo "  make check             Preflight: tmux, projects dir, claude, linger"
 	@echo "  make uninstall         Remove symlinks (leaves ~/projects and the repo alone)"
 	@echo
@@ -47,6 +51,14 @@ link:
 	  fi; \
 	  ln -sfn "$(REPO)/units/$$f" "$$dest"; echo "  link     $$dest"; \
 	done
+	@if [[ -n "$(SKILLS)" ]]; then mkdir -p "$(SKILL_DIR)"; fi
+	@for f in $(SKILLS); do \
+	  dest="$(SKILL_DIR)/$$f"; \
+	  if [[ -e "$$dest" && ! -L "$$dest" ]]; then \
+	    echo "  backup   $$dest -> $$dest.bak"; mv "$$dest" "$$dest.bak"; \
+	  fi; \
+	  ln -sfn "$(REPO)/skills/$$f" "$$dest"; echo "  link     $$dest"; \
+	done
 	@chmod +x $(REPO)/bin/*
 
 relink: link
@@ -66,6 +78,7 @@ install: check link
 	@systemctl --user daemon-reload
 	@systemctl --user enable --now claude-rc.target
 	@systemctl --user enable --now claude-rc-healthcheck.timer
+	@systemctl --user enable --now claude-rc-reap-node-modules.timer
 	@echo
 	@echo "Installed. Enable an instance with:  make enable NAME=<project>"
 
@@ -105,11 +118,12 @@ status:
 	@systemctl --user --no-pager --legend=false list-units \
 	  'claude-rc*' 2>/dev/null || true
 	@echo
-	@systemctl --user --no-pager list-timers claude-rc-healthcheck.timer 2>/dev/null || true
+	@systemctl --user --no-pager list-timers 'claude-rc-*.timer' 2>/dev/null || true
 
 uninstall:
 	@for f in $(SCRIPTS); do rm -f "$(BIN_DIR)/$$f"; done
 	@for f in $(UNITS); do rm -f "$(UNIT_DIR)/$$f"; done
+	@for f in $(SKILLS); do rm -f "$(SKILL_DIR)/$$f"; done
 	@systemctl --user daemon-reload
 	@echo "Symlinks removed. Instance enablement in claude-rc.target.wants/ was left"
 	@echo "in place; run 'make disable NAME=<project>' first if you want it gone."
