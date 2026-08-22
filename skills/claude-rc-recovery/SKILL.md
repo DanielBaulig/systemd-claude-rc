@@ -27,31 +27,35 @@ genuinely ambiguous between two sessions, or when nothing matches. Only they
 can see the session list, which is the authoritative record of what is offline
 — nothing on this host records whether a session was archived deliberately.
 
-To turn a name like "Phase 2" into an id, read the first user prompt of each
-transcript; the title is derived from it:
+Run `claude-rc-sessions`. It lists every session this host has a transcript
+for, with the title it shows in claude.ai/code and what is serving it:
 
-```bash
-for d in ~/.claude/projects/*bridge-cse-*; do
-  id=$(basename "$d" | sed 's/.*bridge-cse-/cse_/')
-  first=$(grep -m1 '"type":"user"' "$d"/*.jsonl 2>/dev/null | head -c 400)
-  echo "$id  ${first:0:160}"
-done
+```
+STATUS    SESSION                        BRANCH                  TITLE
+MISBOUND  cse_01Rtpr7qbCvCds95K5HvJCy1   main                    I want to be able to have multiple...
+OFFLINE   cse_01BmMmCw9vAFBHJbVwptLz4V   design-system           Can we start working on Phase 2?
+SERVED    cse_01XcwysJQpHLiK3VigF5iZsX   planner-chrome          The chrome on the planner doesn't...
+ARCHIVED  cse_016ZKJMBpcswJYyn4APeTfhj                           Say hi
 ```
 
-To list sessions that were never archived, look for surviving worktrees.
-**Archiving a session removes its worktree and branch outright**, so a
-`bridge-cse_*` directory that still exists belongs to a session that was never
-archived — usually one that crashed:
+- **OFFLINE** — worktree exists, nothing serving it. This is the ordinary case:
+  `claude-rc-recover <session>`.
+- **MISBOUND** — live, but its server is running somewhere other than its own
+  worktree, so it is editing the wrong tree. `claude-rc-recover` refuses while
+  something serves it; stop that server first, then recover, which restarts it
+  in the right directory.
+- **SERVED** — healthy, in its own worktree. Nothing to do.
+- **ARCHIVED** — the worktree is already gone, which is what archiving does.
+  Nothing to recover; the transcript is all that remains.
 
-```bash
-ls -d ~/projects/*/.claude/worktrees/bridge-cse_* 2>/dev/null
-```
+If the user's request names several sessions, or a whole server's worth of them
+("gotaspot crashed and dropped everything"), recover each one separately. Each
+gets its own single-session unit and they do not interfere.
 
-Check whether one is already being served before doing anything:
-
-```bash
-pgrep -af -- "--session-id cse_XXXX"
-```
+A caveat on titles: recovering a session compacts its transcript, which
+replaces the original first prompt. `claude-rc-sessions` skips the compaction
+preamble, but a session recovered more than once may still show a title that
+differs from the one in the UI. Match on the id when the user gives one.
 
 Two further signals, both weak on their own:
 
