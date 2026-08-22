@@ -41,6 +41,15 @@ def first_prompt(d):
                     return ' '.join(c.split())[:58]
     return ''
 
+def alive(pid, procstart):
+    # procStart is /proc/<pid>/stat field 22, so a recycled pid cannot pass.
+    try:
+        with open(f'/proc/{pid}/stat') as fh:
+            return fh.read().rsplit(')', 1)[1].split()[19] == str(procstart)
+    except Exception:
+        return False
+
+
 def serving_pid(cse):
     try:
         out = subprocess.run(['pgrep', '-f', '--', f'--session-id {cse}'],
@@ -97,4 +106,58 @@ print()
 print("MISBOUND = live but not in its own worktree; stop its server, then claude-rc-recover")
 print("OFFLINE  = worktree exists, nothing serving it; claude-rc-recover <session>")
 print("ARCHIVED = worktree already removed; nothing to recover")
+
+# --- environment health -----------------------------------------------------
+# Every server registers an "environment" -- the row you pick in claude.ai/code.
+# A plain server reuses whatever environment is recorded in its directory's
+# bridge-pointer.json; a --session-id server adopts the environment of the
+# session it serves. When those coincide, the two servers contend for one
+# environment and the newer registration terminates the older one, so a
+# recovery can silently take a spawner offline (or vice versa).
+pointers = []
+for f in glob.glob(os.path.expanduser('~/.claude/projects/*/bridge-pointer.json')):
+    try: d = json.load(open(f))
+    except Exception: continue
+    d['_dir'] = os.path.basename(os.path.dirname(f))
+    d['_file'] = f
+    d['_worktree_dir'] = '--claude-worktrees-bridge-cse-' in d['_dir']
+    d['_live'] = alive(d.get('pid'), d.get('procStart'))
+    pointers.append(d)
+
+warnings = []
+
+by_env = {}
+for d in pointers:
+    if d.get('_live'):
+        by_env.setdefault(d.get('environmentId'), []).append(d)
+for env, ds in by_env.items():
+    if len(ds) > 1:
+        warnings.append(
+            f"COLLISION  {env} is claimed by {len(ds)} live servers:\n" +
+            "".join(f"             {d['_dir']}  (pid {d['pid']}, {d.get('sessionId')})\n" for d in ds) +
+            "           The newer registration evicts the older. Stop one, or split them:\n"
+            "           delete the spawner's bridge-pointer.json and restart it to get a\n"
+            "           fresh environment.")
+
+for d in pointers:
+    sid = str(d.get('sessionId', ''))
+    if d['_worktree_dir'] or not sid.startswith('cse_'):
+        continue
+    # A pointer outside a worktree naming a session that owns one can only have
+    # been written by a --session-id server run from the wrong directory. Any
+    # plain server started there afterwards inherits that session's environment.
+    if glob.glob(f'{projects}/*/.claude/worktrees/bridge-{sid}'):
+        warnings.append(
+            f"POISONED   {d['_dir']}/bridge-pointer.json names {sid},\n"
+            f"           which has its own worktree. It was written by a server run from\n"
+            f"           the wrong directory, and every plain server started here since has\n"
+            f"           inherited that session's environment. Delete it and restart the\n"
+            f"           server to re-register cleanly:\n"
+            f"             rm {d['_file']}")
+
+if warnings:
+    print()
+    print("WARNINGS")
+    for w in warnings:
+        print("  " + w)
 PY

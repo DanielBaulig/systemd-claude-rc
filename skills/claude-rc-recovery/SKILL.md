@@ -67,6 +67,37 @@ Two further signals, both weak on their own:
   output names the session that died, but only for deaths since that server
   started.
 
+## Check for an environment collision first
+
+Every server registers an *environment* — the row you pick in claude.ai/code. A
+plain server reuses whatever environment is recorded in its directory's
+`bridge-pointer.json`; a `--session-id` server adopts the environment of the
+session it serves. **When those are the same id, the two servers contend for
+one environment and the newer registration terminates the older one.** Starting
+a recovery can therefore take a repository's spawner offline, and restarting a
+spawner can kill a running recovery — this has happened, mid-task.
+
+`claude-rc-sessions` prints a `WARNINGS` block when it sees this. Read it before
+recovering anything, and read it again afterwards.
+
+The usual cause is a `bridge-pointer.json` in a repository root that names a
+*worktree* session, written by a server that was once run from the wrong
+directory; every plain server started there since has inherited that session's
+environment. `claude-rc-sessions` flags that as `POISONED`.
+
+Removing the offending pointer and restarting that server fixes it: the server
+re-registers a fresh environment, the two stop contending, and both appear as
+separate rows that coexist. Nothing is lost — the pointer is a record, not
+state, and it is rewritten on the next start.
+
+```bash
+rm ~/.claude/projects/<the-flagged-dir>/bridge-pointer.json
+systemctl --user restart claude-rc@<repo>.service    # only if it serves nothing
+```
+
+Never restart or stop a server that has a live session without asking the user
+first, whatever a status check just printed.
+
 ## Recover it
 
 Run it. Identifying the session is not the deliverable; the user asked for it
