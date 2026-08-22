@@ -3,10 +3,10 @@ SHELL := /bin/bash
 REPO         := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 BIN_DIR      := $(HOME)/.local/bin
 UNIT_DIR     := $(HOME)/.config/systemd/user
-# Mirrors bin/claude-rc-window's own default so `make enable`'s directory
+# Mirrors bin/claude-rc-serve's own default so `make enable`'s directory
 # check agrees with what the running instance will actually use.
 PROJECTS_DIR := $(if $(CLAUDE_RC_PROJECTS_DIR),$(CLAUDE_RC_PROJECTS_DIR),$(HOME)/projects)
-# Reserved instance name for claude-rc-general.service; see bin/claude-rc-window.
+# Reserved instance name for claude-rc-general.service; see bin/claude-rc-serve.
 GENERAL_NAME := general
 
 SCRIPTS   := $(notdir $(wildcard $(REPO)/bin/*))
@@ -19,7 +19,7 @@ SKILL_DIR  := $(PROJECTS_DIR)/.claude/skills
 .PHONY: help install uninstall enable disable enable-general disable-general check status link relink
 
 help:
-	@echo "claude-rc -- systemd-managed 'claude rc' windows in a shared tmux session"
+	@echo "claude-rc -- systemd-supervised 'claude rc' Remote Control servers"
 	@echo
 	@echo "  make install           Symlink scripts, units + skills, enable linger, start it all"
 	@echo "  make enable NAME=foo   Enable and start an instance for \$$PROJECTS_DIR/foo"
@@ -27,7 +27,7 @@ help:
 	@echo "  make enable-general    Enable and start the instance for the projects root itself"
 	@echo "  make disable-general   Stop and disable it"
 	@echo "  make status            Show the target, the timers and every instance"
-	@echo "  make check             Preflight: tmux, projects dir, claude, linger"
+	@echo "  make check             Preflight: projects dir, claude, linger"
 	@echo "  make uninstall         Remove symlinks (leaves ~/projects and the repo alone)"
 	@echo
 	@echo "Instances are tracked by systemd itself, in"
@@ -64,8 +64,8 @@ link:
 relink: link
 	@systemctl --user daemon-reload
 	@echo "Reloaded. Running instances were not restarted; use"
-	@echo "  systemctl --user reload claude-rc@<name>.service"
-	@echo "to re-run claude-rc-window for one (it respawns only dead windows)."
+	@echo "  systemctl --user restart claude-rc@<name>.service"
+	@echo "to pick up a unit change (this drops that instance's live sessions)."
 
 install: check link
 	@# Lingering is what makes any of this start at boot rather than at first login.
@@ -77,7 +77,6 @@ install: check link
 	fi
 	@systemctl --user daemon-reload
 	@systemctl --user enable --now claude-rc.target
-	@systemctl --user enable --now claude-rc-healthcheck.timer
 	@systemctl --user enable --now claude-rc-reap-node-modules.timer
 	@echo
 	@echo "Installed. Enable an instance with:  make enable NAME=<project>"
@@ -100,8 +99,6 @@ disable-general:
 
 check:
 	@fail=0; \
-	if command -v tmux >/dev/null; then echo "  ok       tmux $$(tmux -V | cut -d' ' -f2)"; \
-	  else echo "  MISSING  tmux"; fail=1; fi; \
 	if [[ -d "$(PROJECTS_DIR)" ]]; then echo "  ok       projects dir ($(PROJECTS_DIR))"; \
 	  else echo "  MISSING  projects dir ($(PROJECTS_DIR))"; fail=1; fi; \
 	if [[ -x "$(HOME)/.claude/local/claude" ]]; then echo "  ok       claude (~/.claude/local/claude)"; \

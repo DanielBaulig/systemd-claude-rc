@@ -1,8 +1,9 @@
 # systemd-claude-rc
 
 Run [Claude Code](https://claude.ai/code) Remote Control (`claude rc`) instances
-as user-level systemd services, each in its own window of a shared `tmux`
-session, started at boot and respawned when they die.
+as user-level systemd services, started at boot and restarted when they die.
+systemd owns each server process directly, so `systemctl` reports the truth
+about it and can restart it without help.
 
 One instance per project, named after the project's directory under the
 projects root (`~/projects` by default, configurable — see
@@ -13,18 +14,18 @@ for work that doesn't belong to any one project.
 
 ```
 $ systemctl --user list-units 'claude-rc*'
-claude-rc@myproject.service    loaded active exited   claude rc window for myproject
-claude-rc@otherproject.service loaded active exited   claude rc window for otherproject
-claude-rc-general.service      loaded active exited   claude rc window for the projects root
+claude-rc@myproject.service    loaded active running  claude rc server for myproject
+claude-rc@otherproject.service loaded active running  claude rc server for otherproject
+claude-rc-general.service      loaded active running  claude rc server for the projects root
+claude-rc.slice                loaded active active   Resource limits shared by every instance
 claude-rc.target               loaded active active   All claude rc instances
-claude-rc-healthcheck.timer    loaded active waiting  Periodically respawn dead windows
 
-$ tmux attach -t crc
+$ tail -n 4 ~/.claude/rc-logs/rc-myproject.out    # the server's own status line
 ```
 
 ## Install
 
-Needs `tmux`, `claude`, and a systemd user manager (any modern Linux).
+Needs `claude` and a systemd user manager (any modern Linux).
 
 Clone it wherever you keep checkouts — the install symlinks back to it, so
 pick somewhere permanent.
@@ -38,9 +39,9 @@ make enable-general            # optional: one instance for the projects root it
 ```
 
 `make install` symlinks the scripts, units and skills into place, enables
-lingering, and starts the target, the healthcheck timer and the node_modules
-reaper timer. It's idempotent — re-run it after a `git pull`, or use
-`make relink` to just refresh the symlinks and reload systemd.
+lingering, and starts the target and the node_modules reaper timer. It's
+idempotent — re-run it after a `git pull`, or use `make relink` to just refresh
+the symlinks and reload systemd.
 
 Two things it can't do for you:
 
@@ -61,41 +62,57 @@ Two things it can't do for you:
 | `make enable-general` | Enable + start the instance for the projects root itself |
 | `make disable-general` | Stop + disable it |
 | `make status` | The target, the timer, and every instance |
-| `make check` | Preflight: tmux, projects dir, claude, linger |
+| `make check` | Preflight: projects dir, claude, linger |
 | `make relink` | Refresh symlinks and `daemon-reload` (after a `git pull`) |
 | `make uninstall` | Remove the symlinks |
 
 Instances are tracked by systemd itself, in
 `~/.config/systemd/user/claude-rc.target.wants/`. There is deliberately no list
-of them in this repo: a second source of truth would drift, and the healthcheck
+of them in this repo: a second source of truth would drift, and systemd
 already reads that directory directly.
 
 ## How it works
 
-`claude-rc@.service` is a `Type=oneshot` template with `RemainAfterExit=yes`.
-`claude-rc-general.service` is the same shape but not templated — there's only
-one projects root. Neither holds the process — they call three scripts:
+`claude-rc@.service` is a `Type=exec` template; `claude-rc-general.service` is
+the same shape but not templated, since there is only one projects root. Both
+run one script:
 
-- **`claude-rc-window <name>|--general`** (`ExecStart`/`ExecReload`)
-  idempotently ensures the window exists: creates the `crc` session if needed,
-  respawns the window in place if the pane died, does nothing if it's healthy.
-  `--general` is the projects-root instance: window name `general`, working
-  directory the projects root itself rather than a subfolder of it.
-- **`claude-rc-window-stop <name>`** (`ExecStop`) sends `SIGTERM` to the pane's
-  process and waits up to 5s. `claude rc` treats that as a clean-shutdown
-  request and closes its own tmux window on the way out — unlike the `SIGHUP`
-  from `tmux kill-window`, which just leaves a dead pane behind. Forced
-  `kill-window` only as a fallback.
-- **`claude-rc-healthcheck`** re-runs `claude-rc-window` for every enabled
-  instance, including the general one if enabled, on a 5-minute timer.
+- **`claude-rc-serve <name>|--general`** (`ExecStart`) resolves the directory
+  and the `claude` binary, then `exec`s the server, replacing itself. Because
+  it execs rather than spawns, the process systemd supervises *is* the server.
+  `--general` is the projects-root instance: working directory the projects
+  root itself rather than a subfolder of it.
 
-The healthcheck exists because oneshot means systemd isn't supervising the
-window: nothing would notice a crash, an OOM kill, or a `claude update`
-restart. The session is created with `remain-on-exit on`, so a crashed window
-stays visible instead of vanishing, and the healthcheck has a target to respawn
-into.
+`Type=exec` is the whole point. An earlier version of this repo used
+`Type=oneshot` with `RemainAfterExit=yes` to launch each server into a `tmux`
+window. tmux moves each pane into its own transient scope, outside the unit's
+cgroup, so systemd had nothing to watch: units reported `active` for three days
+after the server they started had been OOM-killed and replaced, with
+`NRestarts=0`. A 5-minute timer polled for dead windows to make up for it.
+Neither the timer nor tmux is needed once the unit holds the process, and both
+are gone.
 
-Instances run with `--permission-mode auto` and `--no-create-session-in-dir`.
+`Restart=on-failure` with `RestartSec=10s` replaces the healthcheck, bounded by
+`StartLimitBurst=5` in 5 minutes so a server that cannot start ends up visibly
+`failed` rather than looping.
+
+`OOMPolicy=continue` is deliberate and load-bearing. systemd's default is
+`stop`: when the kernel OOM-kills any process in a unit, systemd tears down the
+*whole* unit. In August 2026 that turned one runaway agent into the loss of
+every session its server was hosting. With `continue`, the kernel takes the one
+process and the server keeps running.
+
+`claude-rc.slice` caps what every instance can consume between them, and each
+unit carries its own `MemoryHigh`/`MemoryMax` so a runaway instance is
+contained before it reaches the slice ceiling, let alone the host. A server
+with one live session measures around 300M.
+
+Instances run with `--permission-mode auto`. They no longer pass
+`--no-create-session-in-dir`: that flag is the documented opt-out from
+resumability, so a server started with it archives its sessions on stop and
+nothing survives a restart. Dropping it costs one pre-created session per
+instance in the session list. Set `CLAUDE_RC_NO_SESSION_IN_DIR=1` to restore
+the old behaviour.
 
 ### Paths
 
@@ -128,7 +145,7 @@ ln -s ~/projects/mycompany/monorepo ~/projects/mycompany-monorepo
 make enable NAME=mycompany-monorepo
 ```
 
-The projects root is `CLAUDE_RC_PROJECTS_DIR`, read by `bin/claude-rc-window`
+The projects root is `CLAUDE_RC_PROJECTS_DIR`, read by `bin/claude-rc-serve`
 and defaulting to `~/projects` if unset. Same caveat as `CLAUDE_BIN` above —
 set it persistently for the user manager, not just your shell:
 
@@ -157,14 +174,15 @@ root, picks them up as project scope. After changing a unit file, run
 ## Troubleshooting
 
 ```sh
-systemctl --user status claude-rc@<project>.service   # what systemd thinks
-journalctl --user -u claude-rc@<project>.service      # script output
-tmux attach -t crc                                    # what actually happened
+systemctl --user status claude-rc@<project>.service   # state, restarts, memory
+journalctl --user -u claude-rc@<project>.service      # errors and restarts
+tail -n 4 ~/.claude/rc-logs/rc-<project>.out          # the server's status line
 ```
 
-A window that dies instantly is almost always `claude` not being logged in on
-this machine, or `<projects-dir>/<name>` not existing.
+An instance that dies instantly is almost always `claude` not being logged in
+on this machine, or `<projects-dir>/<name>` not existing; both say so in the
+journal.
 
-Re-running `claude-rc-window` by hand is safe at any time — that's the whole
-design. `systemctl --user reload claude-rc@<name>.service` does the same thing
-through systemd.
+The `.out` file holds the server's redrawn status line — connection state,
+capacity, environment URL — which is why it isn't in the journal, where it
+would bury everything else. It is truncated on each start.
