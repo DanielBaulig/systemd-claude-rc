@@ -51,7 +51,7 @@ for wt in "$projects_dir"/*/.claude/worktrees/bridge-cse_*; do
   [[ -z "$skip" ]] && grep -qF -- "bridge-$lower" <<<"$compose" && skip="docker containers up"
 
   if [[ -z "$skip" ]]; then
-    proj=$(printf '%s' "$wt" | sed 's|^/|-|; s|/|-|g; s|_|-|g')
+    proj=$(printf '%s' "$wt" | sed 's|^/|-|; s|\.|-|g; s|/|-|g; s|_|-|g')
     newest=$(find "$HOME/.claude/projects/$proj" -name '*.jsonl' -printf '%T@\n' 2>/dev/null | sort -rn | sed -n 1p)
     [[ -z "$newest" ]] && newest=$(stat -c %Y "$wt" 2>/dev/null)
     age=$(( (now - ${newest%.*}) / 86400 ))

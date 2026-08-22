@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# claude-rc-recover [--dry-run] <session-id>
+#
+# Bring back one Remote Control session whose process died, by starting a
+# dedicated single-session server in the directory that session belongs to.
+#
+# A plain `claude remote-control` restart only reclaims sessions from a clean
+# shutdown; it never reclaims one whose process was killed. `--session-id`
+# does. Starting that server *inside* the session's worktree is what restores
+# its working directory and branch -- run from the repo root instead and the
+# session comes back on the default branch with a fresh transcript.
+#
+# Takes cse_..., session_... or a bare ULID; they are the same identifier.
+set -uo pipefail
+
+dry=0
+[[ "${1:-}" == "--dry-run" ]] && { dry=1; shift; }
+raw="${1:-}"
+[[ -n "$raw" ]] || { echo "usage: claude-rc-recover [--dry-run] <session-id>" >&2; exit 2; }
+
+ulid=${raw#cse_}; ulid=${ulid#session_}
+cse="cse_${ulid}"
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+
+die() { echo "claude-rc-recover: $*" >&2; exit 1; }
+
+# 1. Refuse if something already serves it, rather than fighting over it.
+if pgrep -f -- "--session-id $cse" >/dev/null 2>&1; then
+  die "$cse is already being served (pid $(pgrep -f -- "--session-id $cse" | tr '\n' ' '))"
+fi
+
+# 2. Locate the directory the session belongs to. A worktree session owns one;
+#    an in-directory session belongs to the server's own cwd.
+dir=""
+for cand in "$projects_dir"/*/.claude/worktrees/"bridge_${ulid}" "$projects_dir"/*/.claude/worktrees/"bridge-${cse}"; do
+  [[ -d "$cand" ]] && { dir="$cand"; break; }
+done
+if [[ -z "$dir" ]]; then
+  # Fall back to the transcript's project directory, whose name encodes the path.
+  pd=$(find "$HOME/.claude/projects" -maxdepth 1 -type d -name "*${ulid}*" 2>/dev/null | head -1)
+  [[ -n "$pd" ]] || die "no worktree and no transcript found for $cse"
+  dir=$(printf '%s' "${pd##*/}" | sed 's|^-|/|; s|--claude-worktrees-.*||; s|-|/|g')
+  [[ -d "$dir" ]] || die "resolved '$dir' from transcript name, but it does not exist"
+fi
+
+# 3. Transcripts are compacted in place on resume -- 32MB collapsed to 7MB in
+#    one observed case, with no backup kept. Copy it aside first; it is the
+#    only record of what the session was doing before it died.
+proj=$(printf '%s' "$dir" | sed 's|^/|-|; s|\.|-|g; s|/|-|g; s|_|-|g')
+pdir="$HOME/.claude/projects/$proj"
+backup=""
+if [[ -d "$pdir" ]]; then
+  newest=$(find "$pdir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n 1p | cut -d' ' -f2-)
+  if [[ -n "$newest" ]]; then
+    backup="$HOME/.claude/rc-logs/pre-recover-${cse}-$(date +%Y%m%dT%H%M%S).jsonl"
+    (( dry )) || { mkdir -p "$(dirname "$backup")"; cp -- "$newest" "$backup"; }
+  fi
+fi
+
+unit="claude-rc-recover-${cse}"
+echo "  session:    $cse"
+echo "  directory:  $dir"
+echo "  branch:     $(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git worktree)')"
+echo "  transcript: ${backup:-<none found>}"
+echo "  unit:       ${unit}.service"
+
+if (( dry )); then echo "  (dry run -- nothing started)"; exit 0; fi
+
+systemd-run --user --unit="$unit" -p Type=exec \
+  --working-directory="$dir" \
+  -p MemoryMax=2G \
+  -p StandardOutput=append:"$HOME/.claude/rc-logs/${unit}.out" \
+  -p StandardError=journal \
+  "${CLAUDE_BIN:-$HOME/.claude/local/claude}" remote-control --session-id "$cse" \
+  || die "systemd-run failed"
+
+echo
+echo "Started. The session reconnects lazily -- send it a message from"
+echo "claude.ai/code and it will pick up where it left off."
+echo "  status:  systemctl --user status ${unit}.service"
+echo "  output:  tail -n 20 ~/.claude/rc-logs/${unit}.out"
+echo "  stop:    systemctl --user stop ${unit}.service"
