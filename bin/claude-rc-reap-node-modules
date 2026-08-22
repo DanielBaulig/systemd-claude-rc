@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# claude-rc-reap-node-modules [--apply] [--days N]
+#
+# Reclaim node_modules from dangling Remote Control worktrees. Archiving a
+# session removes its worktree outright, so a worktree that still exists
+# belongs to a session that was never archived -- usually one that crashed.
+# node_modules is gitignored and reinstallable, so a wrong guess costs one
+# `pnpm install`, not work. Never touches git state, branches or transcripts.
+#
+# Dry-run by default; --apply to delete.
+set -uo pipefail   # deliberately not -e: `head` closing a pipe is not an error
+
+apply=0; days=7
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) apply=1; shift ;;
+    --days)  days="${2:?--days needs a number}"; shift 2 ;;
+    *) echo "usage: claude-rc-reap-node-modules [--apply] [--days N]" >&2; exit 2 ;;
+  esac
+done
+
+# Resolve the projects dir the way bin/claude-rc-window does, so an override
+# applies to the whole system rather than to only some of its parts.
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+
+live_cwds=$(for p in /proc/[0-9]*; do readlink "$p/cwd" 2>/dev/null; done | sort -u)
+compose=$(docker ps --format '{{.Names}}' 2>/dev/null | sed -E 's/-[^-]+-[0-9]+$//' | sort -u)
+now=$(date +%s); total=0; freed=0
+
+shopt -s nullglob
+for wt in "$projects_dir"/*/.claude/worktrees/bridge-cse_*; do
+  [[ -d "$wt" ]] || continue
+  id=$(basename "$wt"); id=${id#bridge-}
+  lower=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+  skip=""
+
+  # A worktree git still has locked, by a process that is still alive, is in use.
+  repo=${wt%/.claude/worktrees/*}
+  lockf="$repo/.git/worktrees/$(basename "$wt")/locked"
+  if [[ -f "$lockf" ]]; then
+    lpid=$(grep -oP 'pid \K[0-9]+' "$lockf" 2>/dev/null)
+    lstart=$(grep -oP 'start \K[0-9]+' "$lockf" 2>/dev/null)
+    if [[ -n "$lpid" && -r "/proc/$lpid/stat" ]]; then
+      cur=$(awk '{print $22}' "/proc/$lpid/stat" 2>/dev/null)
+      [[ "$cur" == "$lstart" ]] && skip="locked by live server pid $lpid"
+    fi
+  fi
+
+  [[ -z "$skip" ]] && grep -qF -- "$wt" <<<"$live_cwds" && skip="a live process cwd"
+  [[ -z "$skip" ]] && pgrep -f -- "$id" >/dev/null 2>&1 && skip="process references $id"
+  [[ -z "$skip" ]] && grep -qF -- "bridge-$lower" <<<"$compose" && skip="docker containers up"
+
+  if [[ -z "$skip" ]]; then
+    proj=$(printf '%s' "$wt" | sed 's|^/|-|; s|/|-|g; s|_|-|g')
+    newest=$(find "$HOME/.claude/projects/$proj" -name '*.jsonl' -printf '%T@\n' 2>/dev/null | sort -rn | sed -n 1p)
+    [[ -z "$newest" ]] && newest=$(stat -c %Y "$wt" 2>/dev/null)
+    age=$(( (now - ${newest%.*}) / 86400 ))
+    (( age < days )) && skip="active ${age}d ago (< ${days}d)"
+  fi
+
+  nm=(); while IFS= read -r line; do nm+=("$line"); done \
+    < <(find "$wt" -name node_modules -type d -prune 2>/dev/null)
+  (( ${#nm[@]} == 0 )) && continue
+  kb=$(du -sc "${nm[@]}" 2>/dev/null | tail -1 | cut -f1)
+  human=$(numfmt --to=iec --from-unit=1024 "${kb:-0}" 2>/dev/null)
+
+  if [[ -n "$skip" ]]; then
+    printf '  SKIP  %-44s %7s  (%s)\n' "$id" "$human" "$skip"
+  else
+    printf '  REAP  %-44s %7s  (%d dir(s))\n' "$id" "$human" "${#nm[@]}"
+    total=$((total+1)); freed=$((freed + ${kb:-0}))
+    (( apply )) && rm -rf -- "${nm[@]}"
+  fi
+done
+
+echo
+printf '%s %d worktree(s), %s\n' \
+  "$( ((apply)) && echo reaped || echo 'would reap' )" "$total" \
+  "$(numfmt --to=iec --from-unit=1024 "$freed" 2>/dev/null)"
