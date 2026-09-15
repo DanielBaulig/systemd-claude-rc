@@ -75,47 +75,26 @@ log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG"; }
 say() { printf '%s\n' "$*"; }
 
 # --- json helpers -----------------------------------------------------------
-# python3 rather than jq: jq is not installed on this host, and claude-rc-sessions
-# already establishes python-inside-bash as how JSON is handled here.
-
-jget() {  # jget <file> <python expression over `d`>  -- prints '' on any failure
-  python3 -c '
-import json,sys
-try:
-    d=json.load(open(sys.argv[1]))
-    v=eval(sys.argv[2],{"d":d,"len":len,"sum":sum,"__builtins__":{}})
-    print("" if v is None else v)
-except Exception:
-    print("")
-' "$1" "$2" 2>/dev/null
+jget() {  # jget <file> <jq filter> [--arg k v ...]  -- prints '' on any failure
+  local f="$1" filter="$2"; shift 2
+  jq -r "$@" "$filter" "$f" 2>/dev/null
 }
 
-state_set() {  # state_set <python statements over `d`>
-  python3 -c '
-import json,sys
-p=sys.argv[1]
-d=json.load(open(p))
-exec(sys.argv[2])
-tmp=p+".tmp"
-json.dump(d,open(tmp,"w"),indent=2)
-import os; os.replace(tmp,p)
-' "$STATE" "$1"
+# Every value crosses into jq as --arg, never interpolated into the filter: a
+# worktree path is attacker-adjacent input as far as quoting is concerned, and
+# temp-file-plus-rename is what makes a crash mid-write leave the old state.
+state_jq() {  # state_jq <jq filter> [--arg k v ...]
+  local filter="$1"; shift
+  jq "$@" "$filter" "$STATE" >"$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
 }
 
 # --- the quota reading ------------------------------------------------------
+# The grant is nested differently depending on how the account was logged in,
+# so this descends rather than naming a path.
 oauth_token() {
-  python3 -c '
-import json,os
-d=json.load(open(os.path.expanduser("~/.claude/.credentials.json")))
-def f(o):
-    if isinstance(o,dict):
-        t=o.get("accessToken")
-        if isinstance(t,str) and t.startswith("sk-ant-oat"): yield t
-        for v in o.values(): yield from f(v)
-    elif isinstance(o,list):
-        for v in o: yield from f(v)
-print(next(f(d),""))
-' 2>/dev/null
+  jq -r '[.. | objects | .accessToken?
+          | select(type == "string" and startswith("sk-ant-oat"))] | first // empty' \
+     "$HOME/.claude/.credentials.json" 2>/dev/null
 }
 
 # Prints: <session_pct> <session_secs_left> <weekly_pct> <weekly_secs_left>
@@ -125,24 +104,18 @@ read_quota() {
   tok=$(oauth_token); [[ -n "$tok" ]] || return 1
   body=$(curl -sS --max-time 20 -H "Authorization: Bearer $tok" \
               -H "anthropic-beta: oauth-2025-04-20" "$USAGE_URL" 2>/dev/null) || return 1
-  printf '%s' "$body" | python3 -c '
-import json,sys,datetime as dt
-d=json.load(sys.stdin)
-now=dt.datetime.now(dt.timezone.utc)
-def pick(kind, scope_none=True):
-    for l in d.get("limits",[]):
-        if l.get("kind")==kind and (l.get("scope") is None or not scope_none):
-            return l
-    return None
-sess=pick("session")
-week=pick("weekly_all")
-def secs(l):
-    if not l or not l.get("resets_at"): return -1
-    return int((dt.datetime.fromisoformat(l["resets_at"])-now).total_seconds())
-if not sess: raise SystemExit(1)
-wp = week["percent"] if week else 0
-print(sess["percent"], secs(sess), wp, secs(week))
-' 2>/dev/null
+  # resets_at carries microseconds and a numeric offset; fromdateiso8601 takes
+  # neither, hence the two subs. Read `limits`, not the top-level objects: it is
+  # the only place is_active and the per-model buckets appear.
+  printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
+      def secs($x): if $x == null or $x.resets_at == null then -1
+                    else (($x.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
+                           | fromdateiso8601) - $now | floor) end;
+      (.limits // []) as $l
+      | ($l | map(select(.kind == "session")) | first) as $s
+      | ($l | map(select(.kind == "weekly_all")) | first) as $w
+      | if $s == null then empty
+        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null
 }
 
 # --- the ceiling ------------------------------------------------------------
@@ -205,19 +178,15 @@ claude_bin() {
 # recorded as finished. Anything unrecognised counts as interrupted: a
 # mistaken retry costs a window, a mistaken "done" loses the work.
 classify() {  # classify <result-json-file>
-  python3 -c '
-import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: print("interrupted crashed"); raise SystemExit
-if d.get("api_error_status")==429: print("interrupted rate_limit")
-elif d.get("subtype")=="error_max_budget_usd": print("interrupted brake")
-elif d.get("subtype")=="error_max_turns": print("interrupted turns")
-elif d.get("subtype")=="success" and not d.get("is_error"): print("done ok")
-else: print("interrupted", d.get("subtype") or "unknown")
-' "$1" 2>/dev/null || echo "interrupted crashed"
+  jq -r 'if   .api_error_status == 429             then "interrupted rate_limit"
+         elif .subtype == "error_max_budget_usd"   then "interrupted brake"
+         elif .subtype == "error_max_turns"        then "interrupted turns"
+         elif .subtype == "success" and (.is_error | not) then "done ok"
+         else "interrupted " + (.subtype // "unknown") end' "$1" 2>/dev/null \
+    || echo "interrupted crashed"
 }
 
-session_id_of() { jget "$1" 'd.get("session_id","")'; }
+session_id_of() { jget "$1" '.session_id // ""'; }
 
 # --- spawning ---------------------------------------------------------------
 # Returns the result json path on stdout; caller classifies it.
@@ -270,23 +239,23 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
                 "$attempts" "$stops" "$wt" "$sid")" >/dev/null 2>&1
     ghq "$repo" issue edit "$issue" --add-label needs-human-intervention >/dev/null 2>&1
   fi
-  state_set "
-p=d.pop('active',None); d['active']=None
-d.setdefault('parked',[]).append({'issue':'$issue','session_id':'$sid','worktree':'$wt',
-  'repo':'$repo','attempts':$attempts,'stops':'$stops','parked_at':'$(date -Is)','warned':False})
-"
+  state_jq '.active = null
+            | .parked += [{issue: $issue, session_id: $sid, worktree: $wt, repo: $repo,
+                           attempts: ($att | tonumber), stops: $stops,
+                           parked_at: $now, warned: false}]' \
+    --arg issue "$issue" --arg sid "$sid" --arg wt "$wt" --arg repo "$repo" \
+    --arg att "$attempts" --arg stops "$stops" --arg now "$(date -Is)"
   log "park worktree=$wt session=$sid issue=${issue:-none} attempts=$attempts stops=$stops"
   say "parked: $wt (issue ${issue:-unknown}, session $sid)"
 }
 
 # A parked record whose issue no longer carries the label is ours again.
+# Tab-separated, and the callers read with IFS set to tab: a worktree path can
+# contain spaces, and a blank issue field must stay a field rather than vanish.
 parked_ready_index() {
-  python3 -c '
-import json,sys
-d=json.load(open(sys.argv[1]))
-for i,p in enumerate(d.get("parked",[])):
-    print(i, p.get("issue") or "", p.get("worktree") or "", p.get("session_id") or "", p.get("repo") or "")
-' "$STATE" 2>/dev/null
+  jq -r '(.parked // []) | to_entries[]
+         | [(.key | tostring), (.value.issue // ""), (.value.worktree // ""),
+            (.value.session_id // ""), (.value.repo // "")] | @tsv' "$STATE" 2>/dev/null
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -307,8 +276,8 @@ case "$mode" in
     in_work_hours && say "working hours: yes" || say "working hours: no"
     [[ -f "$HOLD" ]] && (( $(cat "$HOLD") > $(date +%s) )) \
       && say "HOLD until $(date -d "@$(cat "$HOLD")" '+%F %H:%M')"
-    say "active: $(jget "$STATE" 'd["active"] and d["active"].get("worktree") or "none"')"
-    say "parked: $(jget "$STATE" 'len(d.get("parked",[]))')"
+    say "active: $(jget "$STATE" '.active.worktree // "none"')"
+    say "parked: $(jget "$STATE" '(.parked // []) | length')"
     exit 0 ;;
 esac
 
@@ -322,10 +291,10 @@ fi
 
 # Reconcile: an active record whose run never reported back (the governor was
 # killed mid-job) is an interruption like any other.
-active_wt=$(jget "$STATE" 'd["active"] and d["active"].get("worktree") or ""')
+active_wt=$(jget "$STATE" '.active.worktree // ""')
 if [[ -n "$active_wt" && ! -d "$active_wt" ]]; then
   log "reconcile active worktree vanished, clearing $active_wt"
-  state_set "d['active']=None"
+  state_jq '.active = null'
   active_wt=
 fi
 
@@ -351,24 +320,25 @@ fi
 
 # 1. An active (interrupted) job outranks everything.
 if [[ -n "$active_wt" ]]; then
-  sid=$(jget "$STATE" 'd["active"].get("session_id","")')
-  repo=$(jget "$STATE" 'd["active"].get("repo","")')
-  attempts=$(jget "$STATE" 'd["active"].get("attempts",0)')
+  sid=$(jget "$STATE" '.active.session_id // ""')
+  repo=$(jget "$STATE" '.active.repo // ""')
+  attempts=$(jget "$STATE" '.active.attempts // 0')
   if (( dry_run )); then say "would resume $active_wt (session $sid, attempt $((attempts+1)))"; exit 0; fi
   bf=$(brief_resume); res=$(run_claude "$active_wt" "$bf" "$sid"); rm -f "$bf"
   read -r verdict why < <(classify "$res")
   if [[ "$verdict" == done ]]; then
     log "done resumed worktree=$active_wt session=$sid"
-    state_set "d['active']=None"
+    state_jq '.active = null'
     say "completed: $active_wt"
   else
     attempts=$((attempts+1))
-    stops=$(jget "$STATE" 'd["active"].get("stops","")')
+    stops=$(jget "$STATE" '.active.stops // ""')
     stops="${stops:+$stops,}$why"
     if (( attempts > MAX_ATTEMPTS )); then
       park "$active_wt" "$sid" "$repo" "$attempts" "$stops"
     else
-      state_set "d['active']['attempts']=$attempts; d['active']['stops']='$stops'"
+      state_jq '.active.attempts = ($att | tonumber) | .active.stops = $stops' \
+        --arg att "$attempts" --arg stops "$stops"
       log "interrupted $why worktree=$active_wt attempts=$attempts"
       say "interrupted ($why); will resume"
     fi
@@ -377,23 +347,23 @@ if [[ -n "$active_wt" ]]; then
 fi
 
 # 2. A parked job whose label has been removed is ours again.
-while read -r idx issue wt sid repo; do
+while IFS=$'\t' read -r idx issue wt sid repo; do
   [[ -n "$issue" ]] || continue
   labels=$(ghq "$repo" issue view "$issue" --json labels --jq '[.labels[].name]|join(",")' 2>/dev/null)
   [[ -n "$labels" ]] || continue
   [[ "$labels" == *needs-human-intervention* ]] && continue
   if (( dry_run )); then say "would unpark #$issue ($wt)"; exit 0; fi
   git -C "$repo" worktree unlock "$wt" 2>/dev/null
-  state_set "
-p=d['parked'].pop($idx); p['attempts']=0; p['stops']=''; d['active']=p
-"
+  state_jq '($i | tonumber) as $n
+            | .active = (.parked[$n] | .attempts = 0 | .stops = "")
+            | .parked = (.parked | del(.[$n]))' --arg i "$idx"
   log "unpark issue=$issue worktree=$wt"
   say "unparked #$issue; will resume on the next wake"
   exit 0
 done < <(parked_ready_index)
 
 # 3. Nothing outstanding: start a fresh item, if there is room to park a failure.
-parked_n=$(jget "$STATE" 'len(d.get("parked",[]))')
+parked_n=$(jget "$STATE" '(.parked // []) | length')
 if (( parked_n >= MAX_PARKED )); then
   log "stop parked=$parked_n at MAX_PARKED; queue is jammed on human input, not quota"
   say "not starting: $parked_n parked jobs waiting on you (max $MAX_PARKED)"
@@ -401,16 +371,16 @@ if (( parked_n >= MAX_PARKED )); then
 fi
 
 # Warn once when a parked session is about to outlive its transcript.
-while read -r idx issue wt sid repo; do
+while IFS=$'\t' read -r idx issue wt sid repo; do
   [[ -n "$issue" ]] || continue
-  pa=$(jget "$STATE" "d['parked'][$idx].get('parked_at','')")
-  warned=$(jget "$STATE" "d['parked'][$idx].get('warned',False)")
-  [[ "$warned" == True ]] && continue
+  pa=$(jget "$STATE" '.parked[$i | tonumber].parked_at // ""' --arg i "$idx")
+  warned=$(jget "$STATE" '.parked[$i | tonumber].warned // false' --arg i "$idx")
+  [[ "$warned" == true ]] && continue
   age=$(( ( $(date +%s) - $(date -d "$pa" +%s 2>/dev/null || echo 0) ) / 86400 ))
   (( age < PARK_WARN_DAYS )) && continue
   (( dry_run )) || ghq "$repo" issue comment "$issue" --body \
     "This session has been parked $age days. Transcripts age out at 30, after which \`claude --resume\` will no longer find it — the branch and its commits survive, the context does not." >/dev/null 2>&1
-  state_set "d['parked'][$idx]['warned']=True"
+  state_jq '.parked[$i | tonumber].warned = true' --arg i "$idx"
   log "warn issue=$issue parked ${age}d"
 done < <(parked_ready_index)
 
@@ -441,24 +411,23 @@ fi
 [[ -f "$repo/.claude/settings.local.json" ]] \
   && cp "$repo/.claude/settings.local.json" "$wt/.claude/settings.local.json" 2>/dev/null
 
-state_set "
-d['active']={'worktree':'$wt','repo':'$repo','session_id':'','attempts':0,'stops':'',
-             'started_at':'$(date -Is)'}
-"
+state_jq '.active = {worktree: $wt, repo: $repo, session_id: "", attempts: 0,
+                     stops: "", started_at: $now}' \
+  --arg wt "$wt" --arg repo "$repo" --arg now "$(date -Is)"
 log "start repo=$repo worktree=$wt"
 
 # The brief is the worktree's own copy, so it always matches the base the work
 # is done on rather than whatever the shared checkout happens to have.
 bf=$(brief_new "$wt/$GRIND_DOC"); res=$(run_claude "$wt" "$bf"); rm -f "$bf"
 sid=$(session_id_of "$res")
-[[ -n "$sid" ]] && state_set "d['active']['session_id']='$sid'"
+[[ -n "$sid" ]] && state_jq '.active.session_id = $sid' --arg sid "$sid"
 read -r verdict why < <(classify "$res")
 if [[ "$verdict" == done ]]; then
   log "done worktree=$wt session=$sid"
-  state_set "d['active']=None"
+  state_jq '.active = null'
   say "completed: $wt"
 else
-  state_set "d['active']['attempts']=1; d['active']['stops']='$why'"
+  state_jq '.active.attempts = 1 | .active.stops = $why' --arg why "$why"
   log "interrupted $why worktree=$wt session=$sid attempts=1"
   say "interrupted ($why); will resume"
 fi
