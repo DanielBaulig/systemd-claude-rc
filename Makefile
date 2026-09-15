@@ -78,6 +78,7 @@ install: check link
 	@systemctl --user daemon-reload
 	@systemctl --user enable --now claude-rc.target
 	@systemctl --user enable --now claude-rc-reap-node-modules.timer
+	@systemctl --user enable --now claude-rc-grind.timer
 	@echo
 	@echo "Installed. Enable an instance with:  make enable NAME=<project>"
 

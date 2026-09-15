@@ -1,0 +1,16 @@
+[Unit]
+Description=Check every few minutes whether expiring quota is worth spending
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Fine-grained enough to catch the last quarter hour of a 5-hour window, which
+# is the only part of it the grind is allowed to spend outside working hours.
+AccuracySec=30s
+# A missed check is not worth catching up: by the time the machine is back the
+# window it would have decided about has already reset.
+Persistent=false
+Unit=claude-rc-grind.service
+
+[Install]
+WantedBy=timers.target
