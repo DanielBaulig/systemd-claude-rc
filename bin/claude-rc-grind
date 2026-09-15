@@ -31,10 +31,16 @@ CEIL_OFF_TAIL=75
 CEIL_WORK_FINAL=75
 CEIL_OFF_FINAL=100
 
-WEEKLY_SLOPE=10      # weekly ceiling is (days since reset) * this
-WEEKLY_LIFT_H=20     # ...lifted entirely this many hours before the reset,
-                     # i.e. from Friday evening, expressed relative to the
-                     # reset so it survives the reset time drifting
+# The weekly ceiling steps at WORK_END on the named day and holds until the
+# next step, so it never widens while the human is mid-workday. Wednesday
+# daytime therefore runs at Tuesday's number.
+WEEK_SUN=0
+WEEK_MON=0
+WEEK_TUE=25
+WEEK_WED=50
+WEEK_THU=75
+WEEK_FRI=100
+GRACE_SEC=60         # refuse a reading taken as the window rolls; see below
 
 MODEL="${GRIND_MODEL:-opus}"
 BRAKE_USD="${GRIND_BRAKE_USD:-20}"   # runaway brake, not a ceiling: the budget
@@ -128,6 +134,12 @@ in_work_hours() {
 
 session_ceiling() {  # session_ceiling <secs_left>
   local mins=$(( $1 / 60 ))
+  # A reading taken as the window rolls is about to be replaced: utilization
+  # already reports the fresh window's 0% while secs_left still reports the old
+  # one's last seconds. Untreated that puts a brand-new window in the final
+  # tier at its most permissive ceiling -- the one moment the design exists to
+  # keep clear. Observed 2026-09-15 15:10.
+  (( $1 < GRACE_SEC )) && { echo 0; return; }
   if (( mins > TAIL_MIN )); then echo 0
   elif (( mins > FINAL_MIN )); then
     in_work_hours && echo "$CEIL_WORK_TAIL" || echo "$CEIL_OFF_TAIL"
@@ -136,18 +148,28 @@ session_ceiling() {  # session_ceiling <secs_left>
   fi
 }
 
+# The step in effect is the one set at the most recent WORK_END boundary. If
+# that boundary predates the weekly reset the window is fresh and the answer is
+# zero -- which is what keeps the Saturday afternoon reset from inheriting
+# Friday's 100% and draining a new week on the evening before the busiest day
+# of it.
 weekly_ceiling() {  # weekly_ceiling <secs_left_in_week>
-  local left=$1
+  local left=$1 now boundary wstart
   (( left < 0 )) && { echo 100; return; }                 # no weekly limit reported
-  (( left <= WEEKLY_LIFT_H * 3600 )) && { echo 100; return; }
-  # Days elapsed, counted from the reset: the week runs reset-to-reset, so a
-  # weekday-keyed rule would read the hours just after a Saturday reset as the
-  # end of the week and drain a fresh budget the evening before Sunday.
-  local elapsed=$(( 7*86400 - left ))
-  local day=$(( elapsed / 86400 ))
-  local c=$(( day * WEEKLY_SLOPE ))
-  (( c > 100 )) && c=100
-  echo "$c"
+  now=$(date +%s)
+  if (( $(date +%-H) >= WORK_END )); then
+    boundary=$(date -d "today $WORK_END:00" +%s)
+  else
+    boundary=$(date -d "yesterday $WORK_END:00" +%s)
+  fi
+  wstart=$(( now - (7*86400 - left) ))
+  (( boundary < wstart )) && { echo 0; return; }
+  case "$(date -d "@$boundary" +%a)" in
+    Sun) echo "$WEEK_SUN" ;; Mon) echo "$WEEK_MON" ;;
+    Tue) echo "$WEEK_TUE" ;; Wed) echo "$WEEK_WED" ;;
+    Thu) echo "$WEEK_THU" ;; Fri) echo "$WEEK_FRI" ;;
+    *)   echo 0 ;;                                        # Saturday: post-reset
+  esac
 }
 
 # --- projects and state -----------------------------------------------------
