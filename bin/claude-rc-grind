@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# claude-rc-grind [--dry-run] [--status] [--hold <hours>] [--release]
+#
+# Spend 5-hour-window quota that would otherwise expire, on one work item from
+# a project's GRIND.md. Runs only in the tail of a window, under a ceiling that
+# keeps working hours yours, and only while the weekly burn-down allows it.
+#
+# One job at a time. An interrupted job is resumed on a later wake, never
+# restarted -- a forty-turn item that dies at turn thirty-eight would otherwise
+# re-do the same thirty turns every window and leak a dirty worktree each time.
+# After MAX_ATTEMPTS it is parked: the worktree is `git worktree lock`ed (a
+# reaper refusal, so reclamation cannot take it) and the issue is labelled for
+# a human. Removing that label hands it back.
+#
+# Executes by default; --dry-run decides and prints without spawning.
+set -uo pipefail   # not -e: a failed gh/curl is a decision input, not a crash
+
+# --- configuration ----------------------------------------------------------
+# Every constant here is meant to be tuned in place. The pacing ones were set
+# by judgement, not measurement: no record of a weekly burn-down existed when
+# this was written, which is why the gate logs weekly utilization on every wake.
+
+WORK_DAYS="${GRIND_WORK_DAYS:-Sun Mon Tue Wed Thu Fri}"
+WORK_START="${GRIND_WORK_START:-8}"     # local hour, inclusive
+WORK_END="${GRIND_WORK_END:-19}"        # local hour, exclusive
+
+TAIL_MIN=60          # the window's last hour: the earliest we touch anything
+FINAL_MIN=15         # the last quarter hour: what is left is lost anyway
+CEIL_WORK_TAIL=50    # session-utilization ceilings, percent
+CEIL_OFF_TAIL=75
+CEIL_WORK_FINAL=75
+CEIL_OFF_FINAL=100
+
+WEEKLY_SLOPE=10      # weekly ceiling is (days since reset) * this
+WEEKLY_LIFT_H=20     # ...lifted entirely this many hours before the reset,
+                     # i.e. from Friday evening, expressed relative to the
+                     # reset so it survives the reset time drifting
+
+MODEL="${GRIND_MODEL:-opus}"
+BRAKE_USD="${GRIND_BRAKE_USD:-20}"   # runaway brake, not a ceiling: the budget
+                                     # is checked after a turn completes, so a
+                                     # run overshoots it by one full turn
+MAX_ATTEMPTS=3
+MAX_PARKED=3
+PARK_WARN_DAYS=28    # transcripts age out at 30; after that the session id
+                     # resolves to nothing and only the branch survives
+GRIND_DOC=GRIND.md
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-grind"
+STATE="$STATE_DIR/state.json"
+LOG="$STATE_DIR/grind.log"
+HOLD="$STATE_DIR/hold"
+LOCKFILE="$STATE_DIR/lock"
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+
+USAGE_URL=https://api.anthropic.com/api/oauth/usage
+
+# --- argument handling ------------------------------------------------------
+dry_run=0; mode=run; hold_hours=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --status)  mode=status; shift ;;
+    --hold)    mode=hold; hold_hours="${2:?--hold needs a number of hours}"; shift 2 ;;
+    --release) mode=release; shift ;;
+    -h|--help) sed -n '2,6p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "usage: claude-rc-grind [--dry-run] [--status] [--hold N] [--release]" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR"
+[[ -f "$STATE" ]] || echo '{"active":null,"parked":[]}' >"$STATE"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG"; }
+say() { printf '%s\n' "$*"; }
+
+# --- json helpers -----------------------------------------------------------
+jget() {  # jget <file> <jq filter> [--arg k v ...]  -- prints '' on any failure
+  local f="$1" filter="$2"; shift 2
+  jq -r "$@" "$filter" "$f" 2>/dev/null
+}
+
+# Every value crosses into jq as --arg, never interpolated into the filter: a
+# worktree path is attacker-adjacent input as far as quoting is concerned, and
+# temp-file-plus-rename is what makes a crash mid-write leave the old state.
+state_jq() {  # state_jq <jq filter> [--arg k v ...]
+  local filter="$1"; shift
+  jq "$@" "$filter" "$STATE" >"$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
+}
+
+# --- the quota reading ------------------------------------------------------
+# The grant is nested differently depending on how the account was logged in,
+# so this descends rather than naming a path.
+oauth_token() {
+  jq -r '[.. | objects | .accessToken?
+          | select(type == "string" and startswith("sk-ant-oat"))] | first // empty' \
+     "$HOME/.claude/.credentials.json" 2>/dev/null
+}
+
+# Prints: <session_pct> <session_secs_left> <weekly_pct> <weekly_secs_left>
+# Empty output means the reading failed, which is always a refusal to act.
+read_quota() {
+  local tok body
+  tok=$(oauth_token); [[ -n "$tok" ]] || return 1
+  body=$(curl -sS --max-time 20 -H "Authorization: Bearer $tok" \
+              -H "anthropic-beta: oauth-2025-04-20" "$USAGE_URL" 2>/dev/null) || return 1
+  # resets_at carries microseconds and a numeric offset; fromdateiso8601 takes
+  # neither, hence the two subs. Read `limits`, not the top-level objects: it is
+  # the only place is_active and the per-model buckets appear.
+  printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
+      def secs($x): if $x == null or $x.resets_at == null then -1
+                    else (($x.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
+                           | fromdateiso8601) - $now | floor) end;
+      (.limits // []) as $l
+      | ($l | map(select(.kind == "session")) | first) as $s
+      | ($l | map(select(.kind == "weekly_all")) | first) as $w
+      | if $s == null then empty
+        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null
+}
+
+# --- the ceiling ------------------------------------------------------------
+in_work_hours() {
+  local dow hour
+  dow=$(date +%a); hour=$(date +%-H)
+  [[ " $WORK_DAYS " == *" $dow "* ]] || return 1
+  (( hour >= WORK_START && hour < WORK_END ))
+}
+
+session_ceiling() {  # session_ceiling <secs_left>
+  local mins=$(( $1 / 60 ))
+  if (( mins > TAIL_MIN )); then echo 0
+  elif (( mins > FINAL_MIN )); then
+    in_work_hours && echo "$CEIL_WORK_TAIL" || echo "$CEIL_OFF_TAIL"
+  else
+    in_work_hours && echo "$CEIL_WORK_FINAL" || echo "$CEIL_OFF_FINAL"
+  fi
+}
+
+weekly_ceiling() {  # weekly_ceiling <secs_left_in_week>
+  local left=$1
+  (( left < 0 )) && { echo 100; return; }                 # no weekly limit reported
+  (( left <= WEEKLY_LIFT_H * 3600 )) && { echo 100; return; }
+  # Days elapsed, counted from the reset: the week runs reset-to-reset, so a
+  # weekday-keyed rule would read the hours just after a Saturday reset as the
+  # end of the week and drain a fresh budget the evening before Sunday.
+  local elapsed=$(( 7*86400 - left ))
+  local day=$(( elapsed / 86400 ))
+  local c=$(( day * WEEKLY_SLOPE ))
+  (( c > 100 )) && c=100
+  echo "$c"
+}
+
+# --- projects and state -----------------------------------------------------
+# Discovery reads origin/main, not the working tree: the main checkout on this
+# host sits on whatever branch someone last used, so a working-tree test would
+# make the brief's existence depend on an unrelated checkout's state.
+grind_projects() {  # every project whose origin/main carries a GRIND.md
+  local d
+  for d in "$projects_dir"/*/; do
+    d=${d%/}
+    git -C "$d" cat-file -e "origin/main:$GRIND_DOC" 2>/dev/null && printf '%s\n' "$d"
+  done
+}
+
+ghq() { local dir="$1"; shift; ( cd "$dir" && gh "$@" ); }
+
+claude_bin() {
+  if [[ -n "${CLAUDE_BIN:-}" && -x "$CLAUDE_BIN" ]]; then echo "$CLAUDE_BIN"
+  elif [[ -x "$HOME/.claude/local/claude" ]]; then echo "$HOME/.claude/local/claude"
+  elif [[ -x "$HOME/.local/bin/claude" ]]; then echo "$HOME/.local/bin/claude"
+  else command -v claude
+  fi
+}
+
+# --- classifying how a run stopped ------------------------------------------
+# A rate-limited run reports subtype "success" with is_error true and
+# api_error_status 429, so the 429 test must come first or abandoned work is
+# recorded as finished. Anything unrecognised counts as interrupted: a
+# mistaken retry costs a window, a mistaken "done" loses the work.
+classify() {  # classify <result-json-file>
+  jq -r 'if   .api_error_status == 429             then "interrupted rate_limit"
+         elif .subtype == "error_max_budget_usd"   then "interrupted brake"
+         elif .subtype == "error_max_turns"        then "interrupted turns"
+         elif .subtype == "success" and (.is_error | not) then "done ok"
+         else "interrupted " + (.subtype // "unknown") end' "$1" 2>/dev/null \
+    || echo "interrupted crashed"
+}
+
+session_id_of() { jget "$1" '.session_id // ""'; }
+
+# --- spawning ---------------------------------------------------------------
+# Returns the result json path on stdout; caller classifies it.
+run_claude() {  # run_claude <worktree> <prompt-file> [resume-session-id]
+  local wt="$1" promptf="$2" resume="${3:-}" out
+  out=$(mktemp "$STATE_DIR/result.XXXXXX.json")
+  local -a args=(-p --output-format json --model "$MODEL"
+                 --max-budget-usd "$BRAKE_USD" --permission-mode auto)
+  [[ -n "$resume" ]] && args+=(--resume "$resume")
+  ( cd "$wt" && "$(claude_bin)" "${args[@]}" <"$promptf" ) >"$out" 2>/dev/null
+  printf '%s' "$out"
+}
+
+brief_new() {  # brief_new <grind-md>
+  local f; f=$(mktemp "$STATE_DIR/brief.XXXXXX")
+  {
+    printf 'You are running unattended under claude-rc-grind, with nobody watching.\n'
+    printf 'Your brief is %s, reproduced in full below. Follow it exactly.\n\n' "$1"
+    cat "$1"
+  } >"$f"
+  printf '%s' "$f"
+}
+
+brief_resume() {
+  local f; f=$(mktemp "$STATE_DIR/brief.XXXXXX")
+  cat >"$f" <<'BRIEF'
+A human has intervened since you stopped, and your picture of this working tree
+may be stale. Before continuing: re-read the working tree, re-read the issue
+thread, and confirm the work is still needed and still yours to do. If a human
+has already done it, say so and stop. Otherwise carry on from where you were.
+BRIEF
+  printf '%s' "$f"
+}
+
+# --- parking ----------------------------------------------------------------
+issue_of() {  # the agent writes .grind-item before starting; prose contract in GRIND.md
+  local wt="$1"
+  [[ -f "$wt/.grind-item" ]] || return 1
+  grep -oE '[0-9]+' "$wt/.grind-item" | head -1
+}
+
+park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
+  local wt="$1" sid="$2" repo="$3" attempts="$4" stops="$5" issue
+  git -C "$repo" worktree lock --reason \
+      "grind: parked for a human, session $sid, $(date -Is)" "$wt" 2>/dev/null
+  issue=$(issue_of "$wt") || issue=
+  if [[ -n "$issue" && $dry_run -eq 0 ]]; then
+    ghq "$repo" issue comment "$issue" \
+      --body "$(printf 'Parked by GRIND after %s attempts (%s).\n\nPick it up where it stopped, with its full context:\n\n```\ncd %s\nclaude --resume %s\n```\n\nRemoving the `needs-human-intervention` label hands it back to GRIND.\n' \
+                "$attempts" "$stops" "$wt" "$sid")" >/dev/null 2>&1
+    ghq "$repo" issue edit "$issue" --add-label needs-human-intervention >/dev/null 2>&1
+  fi
+  state_jq '.active = null
+            | .parked += [{issue: $issue, session_id: $sid, worktree: $wt, repo: $repo,
+                           attempts: ($att | tonumber), stops: $stops,
+                           parked_at: $now, warned: false}]' \
+    --arg issue "$issue" --arg sid "$sid" --arg wt "$wt" --arg repo "$repo" \
+    --arg att "$attempts" --arg stops "$stops" --arg now "$(date -Is)"
+  log "park worktree=$wt session=$sid issue=${issue:-none} attempts=$attempts stops=$stops"
+  say "parked: $wt (issue ${issue:-unknown}, session $sid)"
+}
+
+# A parked record whose issue no longer carries the label is ours again.
+# Tab-separated, and the callers read with IFS set to tab: a worktree path can
+# contain spaces, and a blank issue field must stay a field rather than vanish.
+parked_ready_index() {
+  jq -r '(.parked // []) | to_entries[]
+         | [(.key | tostring), (.value.issue // ""), (.value.worktree // ""),
+            (.value.session_id // ""), (.value.repo // "")] | @tsv' "$STATE" 2>/dev/null
+}
+
+# --- subcommands ------------------------------------------------------------
+case "$mode" in
+  hold)
+    date -d "+$hold_hours hours" +%s >"$HOLD"
+    say "holding until $(date -d "+$hold_hours hours" '+%F %H:%M')"; exit 0 ;;
+  release)
+    rm -f "$HOLD"; say "hold released"; exit 0 ;;
+  status)
+    if q=$(read_quota); then
+      set -- $q
+      say "session   $1%  ($(( $2 / 60 )) min left)   ceiling now $(session_ceiling "$2")%"
+      say "weekly    $3%  ($(( $4 / 3600 ))h left)    ceiling now $(weekly_ceiling "$4")%"
+    else
+      say "quota reading unavailable"
+    fi
+    in_work_hours && say "working hours: yes" || say "working hours: no"
+    [[ -f "$HOLD" ]] && (( $(cat "$HOLD") > $(date +%s) )) \
+      && say "HOLD until $(date -d "@$(cat "$HOLD")" '+%F %H:%M')"
+    say "active: $(jget "$STATE" '.active.worktree // "none"')"
+    say "parked: $(jget "$STATE" '(.parked // []) | length')"
+    exit 0 ;;
+esac
+
+# --- one wake ---------------------------------------------------------------
+exec 9>"$LOCKFILE"
+flock -n 9 || { log "skip another instance holds the lock"; exit 0; }
+
+if [[ -f "$HOLD" ]] && (( $(cat "$HOLD" 2>/dev/null || echo 0) > $(date +%s) )); then
+  log "skip hold until $(date -d "@$(cat "$HOLD")" -Is)"; exit 0
+fi
+
+# Reconcile: an active record whose run never reported back (the governor was
+# killed mid-job) is an interruption like any other.
+active_wt=$(jget "$STATE" '.active.worktree // ""')
+if [[ -n "$active_wt" && ! -d "$active_wt" ]]; then
+  log "reconcile active worktree vanished, clearing $active_wt"
+  state_jq '.active = null'
+  active_wt=
+fi
+
+q=$(read_quota) || { log "skip quota reading failed"; exit 0; }
+set -- $q
+sess_pct=$1 sess_left=$2 week_pct=$3 week_left=$4
+sess_ceil=$(session_ceiling "$sess_left")
+week_ceil=$(weekly_ceiling "$week_left")
+
+# Two meters, so two gates -- not a min() of two percentages that measure
+# different things. Both must pass.
+log "wake session=${sess_pct}%/${sess_ceil}% weekly=${week_pct}%/${week_ceil}% mins_left=$(( sess_left / 60 )) work=$(in_work_hours && echo y || echo n)"
+
+if (( sess_pct >= sess_ceil )) || (( week_pct >= week_ceil )); then
+  reason="session ${sess_pct}% vs ${sess_ceil}%"
+  (( week_pct >= week_ceil )) && reason="weekly ${week_pct}% vs ${week_ceil}%"
+  log "hold $reason"
+  (( dry_run )) && say "would not run: $reason"
+  exit 0
+fi
+
+(( dry_run )) && say "headroom: session ${sess_pct}%/${sess_ceil}%, weekly ${week_pct}%/${week_ceil}%"
+
+# 1. An active (interrupted) job outranks everything.
+if [[ -n "$active_wt" ]]; then
+  sid=$(jget "$STATE" '.active.session_id // ""')
+  repo=$(jget "$STATE" '.active.repo // ""')
+  attempts=$(jget "$STATE" '.active.attempts // 0')
+  if (( dry_run )); then say "would resume $active_wt (session $sid, attempt $((attempts+1)))"; exit 0; fi
+  bf=$(brief_resume); res=$(run_claude "$active_wt" "$bf" "$sid"); rm -f "$bf"
+  read -r verdict why < <(classify "$res")
+  if [[ "$verdict" == done ]]; then
+    log "done resumed worktree=$active_wt session=$sid"
+    state_jq '.active = null'
+    say "completed: $active_wt"
+  else
+    attempts=$((attempts+1))
+    stops=$(jget "$STATE" '.active.stops // ""')
+    stops="${stops:+$stops,}$why"
+    if (( attempts > MAX_ATTEMPTS )); then
+      park "$active_wt" "$sid" "$repo" "$attempts" "$stops"
+    else
+      state_jq '.active.attempts = ($att | tonumber) | .active.stops = $stops' \
+        --arg att "$attempts" --arg stops "$stops"
+      log "interrupted $why worktree=$active_wt attempts=$attempts"
+      say "interrupted ($why); will resume"
+    fi
+  fi
+  rm -f "$res"; exit 0
+fi
+
+# 2. A parked job whose label has been removed is ours again.
+while IFS=$'\t' read -r idx issue wt sid repo; do
+  [[ -n "$issue" ]] || continue
+  labels=$(ghq "$repo" issue view "$issue" --json labels --jq '[.labels[].name]|join(",")' 2>/dev/null)
+  [[ -n "$labels" ]] || continue
+  [[ "$labels" == *needs-human-intervention* ]] && continue
+  if (( dry_run )); then say "would unpark #$issue ($wt)"; exit 0; fi
+  git -C "$repo" worktree unlock "$wt" 2>/dev/null
+  state_jq '($i | tonumber) as $n
+            | .active = (.parked[$n] | .attempts = 0 | .stops = "")
+            | .parked = (.parked | del(.[$n]))' --arg i "$idx"
+  log "unpark issue=$issue worktree=$wt"
+  say "unparked #$issue; will resume on the next wake"
+  exit 0
+done < <(parked_ready_index)
+
+# 3. Nothing outstanding: start a fresh item, if there is room to park a failure.
+parked_n=$(jget "$STATE" '(.parked // []) | length')
+if (( parked_n >= MAX_PARKED )); then
+  log "stop parked=$parked_n at MAX_PARKED; queue is jammed on human input, not quota"
+  say "not starting: $parked_n parked jobs waiting on you (max $MAX_PARKED)"
+  exit 0
+fi
+
+# Warn once when a parked session is about to outlive its transcript.
+while IFS=$'\t' read -r idx issue wt sid repo; do
+  [[ -n "$issue" ]] || continue
+  pa=$(jget "$STATE" '.parked[$i | tonumber].parked_at // ""' --arg i "$idx")
+  warned=$(jget "$STATE" '.parked[$i | tonumber].warned // false' --arg i "$idx")
+  [[ "$warned" == true ]] && continue
+  age=$(( ( $(date +%s) - $(date -d "$pa" +%s 2>/dev/null || echo 0) ) / 86400 ))
+  (( age < PARK_WARN_DAYS )) && continue
+  (( dry_run )) || ghq "$repo" issue comment "$issue" --body \
+    "This session has been parked $age days. Transcripts age out at 30, after which \`claude --resume\` will no longer find it — the branch and its commits survive, the context does not." >/dev/null 2>&1
+  state_jq '.parked[$i | tonumber].warned = true' --arg i "$idx"
+  log "warn issue=$issue parked ${age}d"
+done < <(parked_ready_index)
+
+repo=$(grind_projects | head -1)
+if [[ -z "$repo" ]]; then
+  log "idle no project has a $GRIND_DOC"
+  (( dry_run )) && say "no project has a $GRIND_DOC"
+  exit 0
+fi
+
+ts=$(date +%Y%m%d-%H%M%S)
+wt="$repo/.claude/worktrees/grind-$ts"
+if (( dry_run )); then
+  say "would start a new item in $repo -> $wt"
+  exit 0
+fi
+
+# Branch from a freshly fetched origin/main: the local main on this host runs
+# tens of commits behind, and a stale base also means a stale reap script in
+# the worktree, which is what decides how its own cleanup behaves.
+git -C "$repo" fetch --quiet origin main 2>/dev/null
+if ! git -C "$repo" worktree add -b "grind/$ts" "$wt" origin/main >/dev/null 2>&1; then
+  log "error could not create worktree $wt"; say "could not create $wt"; exit 1
+fi
+# The one gitignored file Claude Code itself copies into a worktree it makes.
+# Never .env or apps/web/.dev.vars: those carry a port-block claim and a
+# path-derived compose project name, and setup:worktree generates them.
+[[ -f "$repo/.claude/settings.local.json" ]] \
+  && cp "$repo/.claude/settings.local.json" "$wt/.claude/settings.local.json" 2>/dev/null
+
+state_jq '.active = {worktree: $wt, repo: $repo, session_id: "", attempts: 0,
+                     stops: "", started_at: $now}' \
+  --arg wt "$wt" --arg repo "$repo" --arg now "$(date -Is)"
+log "start repo=$repo worktree=$wt"
+
+# The brief is the worktree's own copy, so it always matches the base the work
+# is done on rather than whatever the shared checkout happens to have.
+bf=$(brief_new "$wt/$GRIND_DOC"); res=$(run_claude "$wt" "$bf"); rm -f "$bf"
+sid=$(session_id_of "$res")
+[[ -n "$sid" ]] && state_jq '.active.session_id = $sid' --arg sid "$sid"
+read -r verdict why < <(classify "$res")
+if [[ "$verdict" == done ]]; then
+  log "done worktree=$wt session=$sid"
+  state_jq '.active = null'
+  say "completed: $wt"
+else
+  state_jq '.active.attempts = 1 | .active.stops = $why' --arg why "$why"
+  log "interrupted $why worktree=$wt session=$sid attempts=1"
+  say "interrupted ($why); will resume"
+fi
+rm -f "$res"

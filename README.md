@@ -171,6 +171,47 @@ than in any one repository so that the `general` instance, which serves that
 root, picks them up as project scope. After changing a unit file, run
 `make relink`.
 
+## Grind
+
+`claude-rc-grind` spends 5-hour-window quota that would otherwise expire, on
+one work item from a project's `GRIND.md`. The timer wakes every five minutes;
+almost every wake decides to do nothing, which is the point.
+
+Two gates, both of which must pass. They read different meters, so this is an
+AND, not a minimum of two percentages:
+
+- **The session window.** Zero until the last hour of the window, then 50%
+  during working hours and 75% outside them, rising to 75%/100% in the last
+  quarter hour. Capacity left on the table at a reset is lost either way.
+- **The weekly burn-down.** `(days since the weekly reset) x 10%`, lifted
+  entirely for the last 20 hours before the reset. Keyed to the reset rather
+  than to the weekday: the week runs reset-to-reset, so a weekday rule would
+  read the hours just after a Saturday reset as the end of the week and drain
+  a fresh budget.
+
+One job at a time. An interrupted job is resumed on a later wake, never
+restarted. After three failed attempts it is parked — the worktree is
+`git worktree lock`ed, which the gotaspot reaper refuses to reclaim, and the
+issue is labelled `needs-human-intervention` with a `claude --resume` command
+in a comment. Removing that label hands it back.
+
+| | |
+|---|---|
+| `claude-rc-grind --status` | Current quota, today's ceilings, active and parked counts |
+| `claude-rc-grind --dry-run` | Decide and print, spawn nothing |
+| `claude-rc-grind --hold 4` | Stand down for four hours, then resume on its own |
+| `claude-rc-grind --release` | Cancel a hold |
+
+State lives in `~/.local/state/claude-rc-grind/`: `state.json` holds the one
+active and up to three parked records, `grind.log` gets a line per wake.
+A hold expires by itself; `systemctl --user stop claude-rc-grind.timer` does
+not, and is the right tool for "not until I say so".
+
+**It ships with `--dry-run` wired into the service.** The pacing constants
+above were set by judgement, with no record of a weekly burn-down to fit them
+to. Watch `grind.log` against real windows, then drop the flag from
+`units/claude-rc-grind.service` to arm it.
+
 ## Troubleshooting
 
 ```sh

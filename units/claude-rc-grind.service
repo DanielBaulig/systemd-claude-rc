@@ -1,0 +1,19 @@
+[Unit]
+Description=Spend expiring 5-hour quota on one GRIND.md work item
+Documentation=https://code.claude.com/docs/en/worktrees
+PartOf=claude-rc.target
+
+[Service]
+Type=oneshot
+# --dry-run until the pacing constants have been watched against real windows;
+# they were set by judgement, with no record of a weekly burn-down to fit them
+# to. Drop the flag to arm it.
+ExecStart=%h/.local/bin/claude-rc-grind --dry-run
+# systemd will not start a second run while one is in flight, so the blocking
+# job is its own concurrency control. This is only the backstop for a job that
+# neither finishes nor trips the brake.
+TimeoutStartSec=2h
+# --user units get a minimal PATH; the script needs git, gh, curl and python3.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Always yields to whatever the human is running.
+Nice=10
