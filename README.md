@@ -182,12 +182,32 @@ AND, not a minimum of two percentages:
 
 - **The session window.** Zero until the last hour of the window, then 50%
   during working hours and 75% outside them, rising to 75%/100% in the last
-  quarter hour. Capacity left on the table at a reset is lost either way.
-- **The weekly burn-down.** `(days since the weekly reset) x 10%`, lifted
-  entirely for the last 20 hours before the reset. Keyed to the reset rather
-  than to the weekday: the week runs reset-to-reset, so a weekday rule would
-  read the hours just after a Saturday reset as the end of the week and drain
-  a fresh budget.
+  quarter hour. Capacity left on the table at a reset is lost either way. A
+  reading taken in the last minute is refused: as the window rolls, utilization
+  already reports the fresh window while the clock still reports the old one,
+  which would otherwise read a brand-new window as an expiring one.
+
+  Note this gates when a job *starts*, not what it spends. A job launched in
+  the tail runs on past the reset, so most of its cost lands in the next
+  window. Off hours that is harmless and is what makes the Friday-night case
+  work; during working hours it is why those ceilings are the conservative
+  ones.
+- **The weekly budget.** A step per day, widening as the week runs out of
+  room to use it:
+
+  | in effect from | until | ceiling |
+  |---|---|---|
+  | Sat 15:00 (reset) | Sun 19:00 | 0% |
+  | Sun 19:00 | Tue 19:00 | 0% |
+  | Tue 19:00 | Wed 19:00 | 25% |
+  | Wed 19:00 | Thu 19:00 | 50% |
+  | Thu 19:00 | Fri 19:00 | 75% |
+  | Fri 19:00 | Sat 15:00 (reset) | 100% |
+
+  Steps land at the end of the workday, never during one, so the ceiling
+  cannot widen while someone is mid-task. A step set before the weekly reset
+  does not carry across it — otherwise Saturday afternoon inherits Friday's
+  100% and drains a fresh week on the evening before the busiest day of it.
 
 One job at a time. An interrupted job is resumed on a later wake, never
 restarted. After three failed attempts it is parked — the worktree is
