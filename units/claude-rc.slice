@@ -11,6 +11,19 @@ Documentation=https://code.claude.com/docs/en/remote-control
 # A server with one live session measures ~306M. The ceiling is therefore far
 # above normal use and is aimed only at runaway growth. Raise both if you
 # genuinely run many concurrent sessions per instance.
+#
+# Raised September 2026, taking exactly that advice: gotaspot routinely hosts
+# 8+ sessions, each with an e2e suite in its own worktree, so the per-unit high
+# went to 6G and this ceiling has to clear one busy instance plus its quieter
+# siblings. MemoryMax stays at 10G -- it is the backstop against the August
+# runaway, and the host only has 15.6G to share with docker and page cache.
 MemoryAccounting=yes
-MemoryHigh=8G
+MemoryHigh=9G
 MemoryMax=10G
+
+# The per-unit MemorySwapMax=2G stops any one instance monopolising the 4G zram
+# device, but three of them at 2G still oversubscribe it. This bounds the fleet
+# as a whole and leaves ~1G for everything outside the slice, which has no other
+# way to reserve it: swap is shared, unaccounted, and invisible to the memory
+# limits above.
+MemorySwapMax=3G
