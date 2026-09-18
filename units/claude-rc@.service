@@ -24,8 +24,23 @@ RestartSec=10s
 # is 'stop', which is what turned a single OOM kill into the loss of every
 # session the server was hosting.
 OOMPolicy=continue
-MemoryHigh=3G
-MemoryMax=6G
+
+# An instance's working set is the sessions it hosts, not the server itself:
+# eight concurrent gotaspot sessions plus their per-worktree builds (vite,
+# workerd, playwright, and a pnpm install per fresh worktree) measured ~7G in
+# September 2026. At the old 3G the kernel parked processes in its
+# __mem_cgroup_handle_over_high penalty sleep rather than killing them, which
+# presents as a hang and not as an OOM: a pnpm install spent 43 minutes of wall
+# clock for 4 minutes of CPU, and the e2e suite never got as far as launching a
+# browser. Throttle above the real working set, not below it.
+MemoryHigh=6G
+MemoryMax=8G
+
+# Swap is a shared 4G zram device, and the limits above do not govern it: an
+# instance pushed over MemoryHigh will displace pages into it until it is full,
+# starving every other cgroup on the host of a resource none of them can see.
+# One instance held 3.93G of the 4G before this cap existed.
+MemorySwapMax=2G
 
 # The server redraws its status line about twice a second. That belongs in a
 # file you can tail, not in the journal, where it would bury everything else;
