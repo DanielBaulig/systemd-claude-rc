@@ -5,10 +5,19 @@ PartOf=claude-rc.target
 
 [Service]
 Type=oneshot
-# --dry-run until the pacing constants have been watched against real windows;
-# they were set by judgement, with no record of a weekly burn-down to fit them
-# to. Drop the flag to arm it.
-ExecStart=%h/.local/bin/claude-rc-grind --dry-run
+# Armed 2026-09-21, after ~6 days of --dry-run against real windows. Two known
+# misfits, accepted rather than fixed first:
+#   - The Fri 19:00 step tops out at 100%, so the only opening in those six days
+#     would have started at 98% weekly. That job 429s within minutes, and a
+#     resume needs both gates to pass again, not just the next weekly step. It
+#     either sits with .active set -- which blocks every later start -- or burns
+#     its three attempts and parks. If the grind goes quiet, check
+#     `claude-rc-grind --status` for an active or parked record before blaming
+#     quota; a park whose worktree never got a .grind-item is silent (see #6).
+#   - Sat 15:00 -> Tue 19:00 is a hard 0%. Four window tails in the following
+#     week cleared the session gate at 19-29% weekly and were held by that step
+#     alone.
+ExecStart=%h/.local/bin/claude-rc-grind
 # systemd will not start a second run while one is in flight, so the blocking
 # job is its own concurrency control. This is only the backstop for a job that
 # neither finishes nor trips the brake.
