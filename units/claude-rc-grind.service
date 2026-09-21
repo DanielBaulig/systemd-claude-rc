@@ -13,7 +13,7 @@ Type=oneshot
 #     either sits with .active set -- which blocks every later start -- or burns
 #     its three attempts and parks. If the grind goes quiet, check
 #     `claude-rc-grind --status` for an active or parked record before blaming
-#     quota; a park whose worktree never got a .grind-item is silent (see #6).
+#     quota.
 #   - Sat 15:00 -> Tue 19:00 is a hard 0%. Four window tails in the following
 #     week cleared the session gate at 19-29% weekly and were held by that step
 #     alone.
