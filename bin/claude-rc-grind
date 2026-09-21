@@ -10,7 +10,10 @@
 # re-do the same thirty turns every window and leak a dirty worktree each time.
 # After MAX_ATTEMPTS it is parked: the worktree is `git worktree lock`ed (a
 # reaper refusal, so reclamation cannot take it) and the issue is labelled for
-# a human. Removing that label hands it back.
+# a human. Removing that label hands it back. A run that got far enough to fail
+# but not far enough to write .grind-item is abandoned rather than parked --
+# there is no issue to hand anyone, and nothing was selected, so the worktree
+# holds no work and is left for the reaper.
 #
 # Executes by default; --dry-run decides and prints without spawning.
 set -uo pipefail   # not -e: a failed gh/curl is a decision input, not a crash
@@ -250,12 +253,28 @@ issue_of() {  # the agent writes .grind-item before starting; prose contract in 
   grep -oE '[0-9]+' "$wt/.grind-item" | head -1
 }
 
+# Attribute first, and lock only once we can. A park exists to hand a worktree
+# to a human, and every handle on it is the issue number: the unpark check, the
+# transcript-age warning and the comment carrying the `claude --resume` line all
+# skip a record whose issue is empty. Parking one anyway would hold a MAX_PARKED
+# slot nothing could ever release, and the lock -- which gotaspot's reaper reads
+# as a refusal (scripts/reap-worktrees.sh, is_locked) -- would strand the
+# directory on disk for good. So a run with no .grind-item is abandoned, not
+# parked. GRIND.md has the agent write that file as soon as it selects, before
+# it touches anything, so the absence of it means nothing was selected and the
+# worktree holds no work to lose.
 park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   local wt="$1" sid="$2" repo="$3" attempts="$4" stops="$5" issue
+  issue=$(issue_of "$wt") || issue=
+  if [[ -z "$issue" ]]; then
+    state_jq '.active = null'
+    log "abandon worktree=$wt session=$sid attempts=$attempts stops=$stops no .grind-item"
+    say "abandoned: $wt (no .grind-item -- nothing was selected; left for the reaper)"
+    return
+  fi
   git -C "$repo" worktree lock --reason \
       "grind: parked for a human, session $sid, $(date -Is)" "$wt" 2>/dev/null
-  issue=$(issue_of "$wt") || issue=
-  if [[ -n "$issue" && $dry_run -eq 0 ]]; then
+  if (( dry_run == 0 )); then
     ghq "$repo" issue comment "$issue" \
       --body "$(printf 'Parked by GRIND after %s attempts (%s).\n\nPick it up where it stopped, with its full context:\n\n```\ncd %s\nclaude --resume %s\n```\n\nRemoving the `needs-human-intervention` label hands it back to GRIND.\n' \
                 "$attempts" "$stops" "$wt" "$sid")" >/dev/null 2>&1
@@ -267,8 +286,8 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
                            parked_at: $now, warned: false}]' \
     --arg issue "$issue" --arg sid "$sid" --arg wt "$wt" --arg repo "$repo" \
     --arg att "$attempts" --arg stops "$stops" --arg now "$(date -Is)"
-  log "park worktree=$wt session=$sid issue=${issue:-none} attempts=$attempts stops=$stops"
-  say "parked: $wt (issue ${issue:-unknown}, session $sid)"
+  log "park worktree=$wt session=$sid issue=$issue attempts=$attempts stops=$stops"
+  say "parked: $wt (issue $issue, session $sid)"
 }
 
 # A parked record whose issue no longer carries the label is ours again.

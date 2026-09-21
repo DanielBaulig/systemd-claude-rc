@@ -215,6 +215,16 @@ restarted. After three failed attempts it is parked — the worktree is
 issue is labelled `needs-human-intervention` with a `claude --resume` command
 in a comment. Removing that label hands it back.
 
+Parking needs an issue number, which the agent writes to `.grind-item` as soon
+as it selects. A run that fails before that point is **abandoned** instead:
+`.active` is cleared, the worktree is left unlocked for the reaper, and a line
+goes in the log. Every handle on a parked record is its issue number — the
+unpark check, the transcript-age warning, the comment carrying the resume
+command — so a record without one could never be handed back, and would hold
+a slot against the three-park limit for good while its lock stopped anything
+from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
+is written before any work, so its absence means nothing was selected.
+
 | | |
 |---|---|
 | `claude-rc-grind --status` | Current quota, today's ceilings, active and parked counts |
@@ -227,10 +237,34 @@ active and up to three parked records, `grind.log` gets a line per wake.
 A hold expires by itself; `systemctl --user stop claude-rc-grind.timer` does
 not, and is the right tool for "not until I say so".
 
-**It ships with `--dry-run` wired into the service.** The pacing constants
-above were set by judgement, with no record of a weekly burn-down to fit them
-to. Watch `grind.log` against real windows, then drop the flag from
-`units/claude-rc-grind.service` to arm it.
+**It shipped with `--dry-run` wired into the service; the flag was dropped on
+2026-09-21.** The constants above are still the judgement calls they started
+as. Six days of dry-run log said two of them are wrong, and it was armed
+anyway:
+
+- The Fri 19:00 step tops out at 100%, so the one opening in those six days
+  (Sat 2026-09-19, 09:04-14:54) would have started a job at **98% weekly**.
+  Two percent is not enough to finish anything: the run 429s, which
+  `classify` records as `interrupted rate_limit`. Resuming needs *both* gates
+  again — the gate block exits before the active branch — so it needs a
+  window tail to coincide with a weekly step that has room, not merely the
+  next step widening. Each failed resume increments `attempts`, so one start
+  plus three resumes parks it, and at 98% those three can all land the same
+  morning. Until one of those happens `.active` stays set, and a set
+  `.active` blocks every new start. **A grind that has gone quiet is a stuck
+  `.active` or a silent park; `--status` prints both counts and is the only
+  thing that tells them apart.**
+- Sat 15:00 -> Tue 19:00 is a hard 0%, which is 45% of the week. Of 70 wakes
+  that cleared the session gate, 57 were held by the weekly one, 29 of those
+  against a 0% ceiling — including four window tails sitting at 19-29%
+  weekly, with most of the budget unspent.
+
+The burn-down the table was guessed against did not show up either. The week
+of 2026-09-15 ran 33% Tue morning to 98% by Thu 19:00, then sat flat at 98%
+for the 44 hours to the reset — exhausted early, not saved for late, which
+is the shape the Tue/Wed/Thu steps (25/50/75) assume. The following week ran
+at less than half that pace. Two weeks, two shapes; `grind.log` keeps
+accumulating, and refitting the table wants more than one of each.
 
 ## Troubleshooting
 
