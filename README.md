@@ -225,6 +225,13 @@ a slot against the three-park limit for good while its lock stopped anything
 from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
 is written before any work, so its absence means nothing was selected.
 
+A run that finishes tidies after itself. If it selected something, its
+`.grind-item` is deleted — the reaper reads that untracked file as uncommitted
+work and would otherwise keep the directory forever. If it selected nothing
+(an empty queue), the worktree and its `grind/<ts>` branch are removed
+outright, provided the tree is clean, holds no unpushed commits, and has no
+`.env` (a stack was brought up; that one is left for the reaper to tear down).
+
 | | |
 |---|---|
 | `claude-rc-grind --status` | Current quota, today's ceilings, active and parked counts |

@@ -295,6 +295,28 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   say "parked: $wt (issue $issue, session $sid)"
 }
 
+# A finished run needs neither its .grind-item nor, if it selected nothing, its
+# worktree. Left alone, both outlive it for good: the reaper reads the untracked
+# .grind-item as uncommitted work and keeps the directory, and an empty run is
+# otherwise the one kind of grind worktree nobody will ever look at. Removal is
+# only ever `git worktree remove` without --force, and only with no .env -- a
+# worktree that brought up a stack is left for the reaper, which tears it down.
+tidy() {  # tidy <repo> <worktree>
+  local repo="$1" wt="$2" branch dirty
+  if issue_of "$wt" >/dev/null; then
+    rm -f "$wt/.grind-item"
+    log "tidy worktree=$wt dropped .grind-item"
+    return
+  fi
+  dirty=$(git -C "$wt" status --porcelain 2>/dev/null) || return
+  [[ -z "$dirty" && ! -e "$wt/.env" ]] || return
+  [[ -z "$(git -C "$wt" log --oneline HEAD --not --remotes 2>/dev/null)" ]] || return
+  branch=$(git -C "$wt" symbolic-ref --short -q HEAD)
+  git -C "$repo" worktree remove "$wt" 2>/dev/null || return
+  [[ "$branch" == grind/* ]] && git -C "$repo" branch -D "$branch" >/dev/null 2>&1
+  log "tidy removed worktree=$wt branch=$branch nothing selected"
+}
+
 # A parked record whose issue no longer carries the label is ours again.
 # Tab-separated, and the callers read with IFS set to tab: a worktree path can
 # contain spaces, and a blank issue field must stay a field rather than vanish.
@@ -375,6 +397,7 @@ if [[ -n "$active_wt" ]]; then
   if [[ "$verdict" == done ]]; then
     log "done resumed worktree=$active_wt session=$sid"
     state_jq '.active = null'
+    tidy "$repo" "$active_wt"
     say "completed: $active_wt"
   else
     attempts=$((attempts+1))
@@ -471,6 +494,7 @@ read -r verdict why < <(classify "$res")
 if [[ "$verdict" == done ]]; then
   log "done worktree=$wt session=$sid"
   state_jq '.active = null'
+  tidy "$repo" "$wt"
   say "completed: $wt"
 else
   state_jq '.active.attempts = 1 | .active.stops = $why' --arg why "$why"
