@@ -116,7 +116,10 @@ read_quota() {
   # resets_at carries microseconds and a numeric offset; fromdateiso8601 takes
   # neither, hence the two subs. Read `limits`, not the top-level objects: it is
   # the only place is_active and the per-model buckets appear.
-  printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
+  # jq exits 0 on `empty`, so the status alone does not catch a body without a
+  # session limit (an error payload, say). Callers `set -- $q` under set -u.
+  local q
+  q=$(printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
       def secs($x): if $x == null or $x.resets_at == null then -1
                     else (($x.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
                            | fromdateiso8601) - $now | floor) end;
@@ -124,7 +127,9 @@ read_quota() {
       | ($l | map(select(.kind == "session")) | first) as $s
       | ($l | map(select(.kind == "weekly_all")) | first) as $w
       | if $s == null then empty
-        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null
+        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null) || return 1
+  [[ -n "$q" ]] || return 1
+  printf '%s\n' "$q"
 }
 
 # --- the ceiling ------------------------------------------------------------
