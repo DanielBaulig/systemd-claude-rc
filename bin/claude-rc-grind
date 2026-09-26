@@ -295,19 +295,16 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   say "parked: $wt (issue $issue, session $sid)"
 }
 
-# A finished run needs neither its .grind-item nor, if it selected nothing, its
-# worktree. Left alone, both outlive it for good: the reaper reads the untracked
-# .grind-item as uncommitted work and keeps the directory, and an empty run is
-# otherwise the one kind of grind worktree nobody will ever look at. Removal is
-# only ever `git worktree remove` without --force, and only with no .env -- a
-# worktree that brought up a stack is left for the reaper, which tears it down.
+# A run that ended on its own and selected nothing leaves a worktree nobody will
+# ever look at; on a queue stalled on human input that is one every wake. "Ended
+# on its own" is classify's `done`, which says the session stopped cleanly, not
+# that any ticket is finished -- a 429 or a brake is `interrupted` and never gets
+# here. Removal is only ever `git worktree remove` without --force, and only with
+# no .env: a worktree that brought up a stack is left for the reaper, which
+# tears it down. Anything that did select is left for the reaper as well.
 tidy() {  # tidy <repo> <worktree>
   local repo="$1" wt="$2" branch dirty
-  if issue_of "$wt" >/dev/null; then
-    rm -f "$wt/.grind-item"
-    log "tidy worktree=$wt dropped .grind-item"
-    return
-  fi
+  issue_of "$wt" >/dev/null && return
   dirty=$(git -C "$wt" status --porcelain 2>/dev/null) || return
   [[ -z "$dirty" && ! -e "$wt/.env" ]] || return
   [[ -z "$(git -C "$wt" log --oneline HEAD --not --remotes 2>/dev/null)" ]] || return
@@ -460,6 +457,24 @@ if [[ -z "$repo" ]]; then
   exit 0
 fi
 
+# A rough gate, not the selection: GRIND.md decides that, and may still pass on
+# everything counted here (a ticket with an open PR, say). But with no `grind`
+# issue free of needs-human-intervention there is certainly nothing to select,
+# and spawning a session every wake to find that out is what drains a stalled
+# queue's windows. A failed gh call is a refusal, like a failed quota reading.
+eligible=$(ghq "$repo" issue list --label grind --state open --limit 100 \
+             --json labels --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))] | length' \
+             2>/dev/null)
+if [[ -z "$eligible" ]]; then
+  log "skip could not list grind issues in $repo"; (( dry_run )) && say "could not list grind issues"
+  exit 0
+fi
+if (( eligible == 0 )); then
+  log "idle no open grind issue in $repo without needs-human-intervention"
+  (( dry_run )) && say "no open grind issue without needs-human-intervention"
+  exit 0
+fi
+
 ts=$(date +%Y%m%d-%H%M%S)
 wt="$repo/.claude/worktrees/grind-$ts"
 if (( dry_run )); then
@@ -471,6 +486,13 @@ fi
 # tens of commits behind, and a stale base also means a stale reap script in
 # the worktree, which is what decides how its own cleanup behaves.
 git -C "$repo" fetch --quiet origin main 2>/dev/null
+# .grind-item is the engine's file, not the project's, so it is ignored here
+# rather than in each project's .gitignore. info/exclude lives in the common git
+# dir, so this one line covers every worktree of the clone. Untracked, the file
+# made the reaper read a finished worktree as uncommitted work and keep it.
+excl=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude
+grep -qxF /.grind-item "$excl" 2>/dev/null \
+  || { mkdir -p "${excl%/*}" && echo /.grind-item >>"$excl"; }
 if ! git -C "$repo" worktree add -b "grind/$ts" "$wt" origin/main >/dev/null 2>&1; then
   log "error could not create worktree $wt"; say "could not create $wt"; exit 1
 fi
