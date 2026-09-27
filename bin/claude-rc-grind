@@ -54,6 +54,9 @@ MAX_PARKED=3
 PARK_WARN_DAYS=28    # transcripts age out at 30; after that the session id
                      # resolves to nothing and only the branch survives
 GRIND_DOC=GRIND.md
+# How to run as a grind job, in any project; GRIND_DOC only says what to work on.
+# Found beside this script's real path, since ~/.local/bin holds a symlink to it.
+GRIND_SKILL="$(dirname "$(readlink -f "$0")")/../skills/claude-rc-grind/SKILL.md"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-grind"
 STATE="$STATE_DIR/state.json"
@@ -230,11 +233,17 @@ run_claude() {  # run_claude <worktree> <prompt-file> [resume-session-id]
   printf '%s' "$out"
 }
 
+# The operating rules are inlined rather than left for the agent to load: they
+# are what keeps an unattended run to one item and off a sleep loop, and a
+# skill the agent never thought to open binds nothing. Frontmatter stripped.
 brief_new() {  # brief_new <grind-md>
   local f; f=$(mktemp "$STATE_DIR/brief.XXXXXX")
   {
     printf 'You are running unattended under claude-rc-grind, with nobody watching.\n'
-    printf 'Your brief is %s, reproduced in full below. Follow it exactly.\n\n' "$1"
+    printf 'How to run as a grind job comes first, then the project brief, %s.\n' "$1"
+    printf 'Both are reproduced in full below. Follow them exactly.\n\n'
+    awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$GRIND_SKILL"
+    printf '\n---\n\n'
     cat "$1"
   } >"$f"
   printf '%s' "$f"
@@ -481,6 +490,10 @@ if (( open_issues + open_prs == 0 )); then
   log "idle no open grind issue without needs-human-intervention, no grind pull request to follow up, in $repo"
   (( dry_run )) && say "nothing eligible: no open grind issue or pull request needing work"
   exit 0
+fi
+
+if [[ ! -r "$GRIND_SKILL" ]]; then
+  log "error operating rules missing at $GRIND_SKILL"; say "missing $GRIND_SKILL"; exit 1
 fi
 
 ts=$(date +%Y%m%d-%H%M%S)
