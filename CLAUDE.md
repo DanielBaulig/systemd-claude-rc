@@ -40,14 +40,27 @@ under test, it can pull the rug out from under the session you're running in.
     && { echo "that's my own pane, refusing" >&2; exit 1; }
   ```
 - **Restarting `claude-rc@<name>.service` for the instance you're running as
-  will kill you mid-task.** Reloading is fine (`claude-rc-window` only
-  respawns a *dead* window), but `systemctl --user stop/restart` on your own
-  instance, or anything that forces `claude-rc-window-stop`, is not.
-- When testing changes to `bin/claude-rc-window` or the units, prefer a
-  sandbox — a throwaway `HOME` and `CLAUDE_RC_PROJECTS_DIR`, plus
-  `tmux -L <name>` on every tmux call — over touching the real
-  `~/.config/systemd/user` or the real `crc` session. Note that
-  `CLAUDE_RC_PROJECTS_DIR` and `HOME` *do* isolate; `TMUX_TMPDIR` does not,
-  per the first bullet. To simulate a crash without disturbing anything else,
-  `kill -9` one window's `#{pane_pid}` — `remain-on-exit on` leaves the dead
-  pane in place, which is exactly the state the healthcheck looks for.
+  kills your current turn.** The session itself comes back — the server keeps
+  its environment on SIGTERM and re-serves the session on its next message
+  (README, "Restarting an instance") — but the tool call you are in the middle
+  of, and any subagents or background tasks, die with the worker, and nobody
+  is left to send that next message. `claude-rc-restart` refuses this case;
+  `systemctl --user stop/restart` does not. `make relink` (daemon-reload) is
+  fine: it restarts nothing.
+- To find out which instance that is, walk your own ancestry: the unit whose
+  `MainPID` is an ancestor of `$$` is the one serving you. Nothing in the
+  environment names it, and the `.out` files list every instance's sessions.
+- When testing the units or a server's behaviour, use a throwaway instance
+  rather than a production one: a scratch git repository outside the projects
+  root, a trust entry for it in `~/.claude.json` (`claude remote-control`
+  refuses an untrusted directory and cannot prompt), and a transient unit —
+  `systemd-run --user --unit=claude-rc-lab-<what> -p Type=exec
+  --working-directory=<dir> ~/.claude/local/claude remote-control
+  --name lab-<what> --verbose --debug-file <log>`. It registers its own
+  environment, so it cannot collide with a production one, and the debug file
+  is where the `[bridge:*]` lines that say what the server did end up. To
+  simulate a crash, `systemctl --user kill -s SIGKILL` that unit. App-side
+  steps (opening a session, sending it a message) need the user; ask with the
+  exact prompt to send. The tmux bullets above predate `Type=exec` — the
+  servers no longer run in tmux — but the lesson about identifying your own
+  process before killing anything stands.

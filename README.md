@@ -114,6 +114,53 @@ nothing survives a restart. Dropping it costs one pre-created session per
 instance in the session list. Set `CLAUDE_RC_NO_SESSION_IN_DIR=1` to restore
 the old behaviour.
 
+### Restarting an instance
+
+Restarting a server does not lose its sessions. Verified 2026-09-27 on Claude
+Code 2.1.280 with a throwaway instance — a clean `systemctl stop`, a `SIGKILL`
+of server and workers together, a restart with a tool call in flight, and the
+same again in worktree mode — and read off the binary:
+
+- On SIGTERM the server stops each worker, marks their work stopped, and logs
+  `Skipping archive+deregister to allow resume`: the environment (the row in
+  claude.ai/code) is marked offline, not deregistered, and nothing is
+  archived. This is the resumability that dropping
+  `--no-create-session-in-dir` bought.
+- On start it reads `bridge-pointer.json`, re-registers the *same* environment,
+  and re-queues the pre-created session, whose worker is back within seconds.
+  Every other session comes back on its next message or app interaction: the
+  app shows "Can't reach <host>" until then, the message re-queues the session
+  as work, and the server spawns its worker within a second, with the
+  conversation intact. A worker that crashes on its own is re-served the same
+  way (Claude Code 2.1.238+). A session that was mid-turn is told its turn was
+  interrupted and carries on — observed: it restarted the killed command by
+  itself and said so. The documented window is about four hours.
+- In worktree mode the server removes the worktree of a *live* session only if
+  it is clean and not ahead of its base; dirty or ahead ones are kept
+  (`[bridge:worktree] kept … dirty=true` in the debug log). A removed one is
+  recreated at the same path when the session resumes, so the session comes
+  back in its own worktree either way and nothing on disk is lost.
+
+What a restart does cost:
+
+- The turn in flight. Its tool call is killed and the session is told, but
+  subagents, workflows and background tasks inside that worker die with it.
+  Restart when the instance is idle if you can: `claude-rc-restart` prints the
+  live worker count first, and refuses the instance that serves the shell it
+  was run from — that session would lose its turn with nobody left to send
+  the next message.
+- A gap of a few seconds for the pre-created session, and until the next
+  message for the others.
+
+`claude update` replaces the binary on disk, and workers spawned after that
+already run the new version — the server execs children by path. Only the
+server process itself stays old until it is restarted:
+
+```sh
+claude update
+claude-rc-restart --all      # every running instance except the one you are in
+```
+
 ### Paths
 
 The claude binary is looked up as `~/.claude/local/claude`, then

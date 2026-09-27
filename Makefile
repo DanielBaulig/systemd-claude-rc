@@ -64,8 +64,9 @@ link:
 relink: link
 	@systemctl --user daemon-reload
 	@echo "Reloaded. Running instances were not restarted; use"
-	@echo "  systemctl --user restart claude-rc@<name>.service"
-	@echo "to pick up a unit change (this drops that instance's live sessions)."
+	@echo "  claude-rc-restart <name>     (or --all)"
+	@echo "to pick up a unit change. Sessions come back after a restart, but the"
+	@echo "turn each worker is in the middle of does not -- see README."
 
 install: check link
 	@# Lingering is what makes any of this start at boot rather than at first login.

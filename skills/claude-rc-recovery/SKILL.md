@@ -3,16 +3,26 @@ name: claude-rc-recovery
 description: Use when asked to revive, recover, restore or bring back a Claude Code Remote Control session on this host, or when one has gone offline, shows "Can't reach your computer" / computer_unreachable in claude.ai/code, or a `claude rc` server crashed and dropped its sessions. Session titles are derived from their first prompt, so a request naming what sounds like a feature or topic -- "revive parallel worktree support", "bring back the design system one" -- is naming a session, not asking for a code change. Identify the session and recover it with claude-rc-recover. Not for starting new sessions or changing worktree configuration.
 ---
 
-# Recovering a crashed Remote Control session
+# Recovering a Remote Control session
 
-A `claude rc` server hands each session to a child `claude.exe`. When one of
-those children dies uncleanly — OOM kill, `kill -9`, a crash — the session
-goes offline and **no restart of the server brings it back**. Restarting
-reclaims sessions only from a *clean* shutdown, and it does so lazily, when a
-message arrives. A hard-killed session is never reclaimed that way.
+A `claude rc` server hands each session to a child `claude.exe`. Since Claude
+Code 2.1.238 a session whose child died — OOM kill, `kill -9`, a crash — is
+re-served by its own server the next time a message arrives, and restarting
+the server, cleanly or not, brings its sessions back the same way: the
+pre-created one at once, the rest on their next message. Verified on this
+host 2026-09-27; see the README, "Restarting an instance".
 
-`claude remote-control --session-id <id>` does reclaim it. That is the whole
-recovery mechanism; everything below is about aiming it correctly.
+**So check the ordinary path first.** If the session's server is running and
+`claude-rc-sessions` shows no COLLISION or POISONED warning involving it, ask
+the user to send the session a message, and continue here only if that does
+not bring it back.
+
+`claude remote-control --session-id <id>` is for what that path does not
+cover: the server is gone and should not be restarted; the session's
+environment is no longer the one its server registers (a cleared or poisoned
+pointer — the server logs `sessions attached to <env> cannot be reconnected`);
+or the window, about four hours, has passed. That is the whole recovery
+mechanism; everything below is about aiming it correctly.
 
 ## Identify the session
 

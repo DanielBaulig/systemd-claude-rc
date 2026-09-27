@@ -20,6 +20,16 @@ ExecStart=%h/.local/bin/claude-rc-serve %i
 Restart=on-failure
 RestartSec=10s
 
+# On SIGTERM the server stops its own workers, tells the API their work has
+# stopped, and marks the environment offline so the sessions can be resumed
+# (README, "Restarting an instance"). The default KillMode=control-group sends
+# SIGTERM to the workers at the same instant, racing that sequence; mixed
+# signals only the server and lets it do the ordering, then SIGKILLs whatever
+# is left. The server waits up to 30s for a worker before force-killing it, so
+# the stop timeout has to clear that.
+KillMode=mixed
+TimeoutStopSec=45s
+
 # One agent dying must not take its siblings with it. systemd's default here
 # is 'stop', which is what turned a single OOM kill into the loss of every
 # session the server was hosting.
