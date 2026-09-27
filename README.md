@@ -225,6 +225,13 @@ a slot against the three-park limit for good while its lock stopped anything
 from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
 is written before any work, so its absence means nothing was selected.
 
+A run's prompt is two documents: the `claude-rc-grind` skill
+(`skills/claude-rc-grind/SKILL.md`), which says how to run as a grind job in
+any project — one item then stop, write `.grind-item`, expect to be cut off,
+stall rather than guess, leave checking back to the engine — and the project's
+`GRIND.md`, which says only what is worth working on there. The skill is
+inlined, not left for the agent to load, and a run refuses to start without it.
+
 Before starting a fresh item, the grind checks that at least one open `grind`
 issue lacks `needs-human-intervention`, or that a `grind` pull request is
 waiting on its author (`changes-requested`, a conflict, or a failing check). It's a rough gate, not the selection
