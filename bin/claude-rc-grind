@@ -459,19 +459,27 @@ fi
 
 # A rough gate, not the selection: GRIND.md decides that, and may still pass on
 # everything counted here (a ticket with an open PR, say). But with no `grind`
-# issue free of needs-human-intervention there is certainly nothing to select,
-# and spawning a session every wake to find that out is what drains a stalled
-# queue's windows. A failed gh call is a refusal, like a failed quota reading.
-eligible=$(ghq "$repo" issue list --label grind --state open --limit 100 \
-             --json labels --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))] | length' \
-             2>/dev/null)
-if [[ -z "$eligible" ]]; then
-  log "skip could not list grind issues in $repo"; (( dry_run )) && say "could not list grind issues"
+# issue free of needs-human-intervention, and no `grind` pull request waiting on
+# its author, there is certainly nothing to select, and spawning a session every
+# wake to find that out is what drains a stalled queue's windows. A pull request
+# waits on its author when it is labelled changes-requested, has a conflict, or
+# fails a check on its latest commit (GRIND.md item 0). A failed gh call is a
+# refusal, like a failed quota reading.
+open_issues=$(ghq "$repo" issue list --label grind --state open --limit 100 --json labels     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))] | length' 2>/dev/null)
+open_prs=$(ghq "$repo" pr list --label grind --state open --limit 100     --json labels,mergeable,statusCheckRollup     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))
+               | select(any(.labels[]; .name == "changes-requested")
+                        or .mergeable == "CONFLICTING"
+                        or any(.statusCheckRollup[]?; (.conclusion // .state) as $c
+                               | ["FAILURE","ERROR","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"]
+                               | index($c)))] | length' 2>/dev/null)
+if [[ -z "$open_issues" || -z "$open_prs" ]]; then
+  log "skip could not list grind issues and pull requests in $repo"
+  (( dry_run )) && say "could not list grind issues and pull requests"
   exit 0
 fi
-if (( eligible == 0 )); then
-  log "idle no open grind issue in $repo without needs-human-intervention"
-  (( dry_run )) && say "no open grind issue without needs-human-intervention"
+if (( open_issues + open_prs == 0 )); then
+  log "idle no open grind issue without needs-human-intervention, no grind pull request to follow up, in $repo"
+  (( dry_run )) && say "nothing eligible: no open grind issue or pull request needing work"
   exit 0
 fi
 

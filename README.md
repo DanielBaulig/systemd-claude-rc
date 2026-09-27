@@ -226,7 +226,8 @@ from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
 is written before any work, so its absence means nothing was selected.
 
 Before starting a fresh item, the grind checks that at least one open `grind`
-issue lacks `needs-human-intervention`. It's a rough gate, not the selection
+issue lacks `needs-human-intervention`, or that a `grind` pull request is
+waiting on its author (`changes-requested`, a conflict, or a failing check). It's a rough gate, not the selection
 -- `GRIND.md` may still pass on everything it counts -- but when it finds none,
 no session is spawned just to discover the queue is empty.
 
