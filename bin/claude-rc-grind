@@ -467,15 +467,28 @@ if [[ -z "$repo" ]]; then
 fi
 
 # A rough gate, not the selection: GRIND.md decides that, and may still pass on
-# everything counted here (a ticket with an open PR, say). But with no `grind`
-# issue free of needs-human-intervention, and no `grind` pull request waiting on
-# its author, there is certainly nothing to select, and spawning a session every
-# wake to find that out is what drains a stalled queue's windows. A pull request
-# waits on its author when it is labelled changes-requested, has a conflict, or
-# fails a check on its latest commit (GRIND.md item 0). A failed gh call is a
+# everything counted here (a ticket with an open PR, say). But with nothing below
+# there is certainly nothing to select, and spawning a session every wake to find
+# that out is what drains a stalled queue's windows. A failed gh call is a
 # refusal, like a failed quota reading.
-open_issues=$(ghq "$repo" issue list --label grind --state open --limit 100 --json labels     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))] | length' 2>/dev/null)
-open_prs=$(ghq "$repo" pr list --label grind --state open --limit 100     --json labels,mergeable,statusCheckRollup     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))
+#
+# An issue counts when it is not parked or stalled, carries a label some work
+# item acts on, and -- for a grilling ticket -- its latest comment is not an
+# agent's. A grilling round is answered in the thread with no relabel, so an
+# agent speaking last means the round is still open; anyone else speaking last
+# may be an answer, and the session reads the thread to decide. A pull request
+# counts when it waits on its author: changes-requested, a conflict, or a failed
+# check on its latest commit (GRIND.md item 0).
+open_issues=$(ghq "$repo" issue list --label grind --state open --limit 100 --json labels,comments \
+    --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))
+               | select(any(.labels[]; .name | IN("ready-for-agent", "needs-research",
+                                                  "needs-grilling", "needs-triage")))
+               | select((any(.labels[]; .name == "needs-grilling") | not)
+                        or ((.comments | sort_by(.createdAt) | last | .body // "")
+                            | test("<!-- agent ") | not))] | length' 2>/dev/null)
+open_prs=$(ghq "$repo" pr list --label grind --state open --limit 100 \
+    --json labels,mergeable,statusCheckRollup \
+    --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))
                | select(any(.labels[]; .name == "changes-requested")
                         or .mergeable == "CONFLICTING"
                         or any(.statusCheckRollup[]?; (.conclusion // .state) as $c
@@ -487,7 +500,7 @@ if [[ -z "$open_issues" || -z "$open_prs" ]]; then
   exit 0
 fi
 if (( open_issues + open_prs == 0 )); then
-  log "idle no open grind issue without needs-human-intervention, no grind pull request to follow up, in $repo"
+  log "idle no grind issue or pull request with work waiting in $repo"
   (( dry_run )) && say "nothing eligible: no open grind issue or pull request needing work"
   exit 0
 fi

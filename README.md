@@ -232,9 +232,12 @@ stall rather than guess, leave checking back to the engine — and the project's
 `GRIND.md`, which says only what is worth working on there. The skill is
 inlined, not left for the agent to load, and a run refuses to start without it.
 
-Before starting a fresh item, the grind checks that at least one open `grind`
-issue lacks `needs-human-intervention`, or that a `grind` pull request is
-waiting on its author (`changes-requested`, a conflict, or a failing check). It's a rough gate, not the selection
+Before starting a fresh item, the grind checks that some `grind` issue or pull
+request has work waiting: an issue without `needs-human-intervention` carrying a
+label a work item acts on (`ready-for-agent`, `needs-research`, `needs-triage`,
+or `needs-grilling` whose latest comment is not an agent's -- an agent speaking
+last means the round is unanswered), or a pull request waiting on its author
+(`changes-requested`, a conflict, or a failing check). It's a rough gate, not the selection
 -- `GRIND.md` may still pass on everything it counts -- but when it finds none,
 no session is spawned just to discover the queue is empty.
 
