@@ -116,7 +116,10 @@ read_quota() {
   # resets_at carries microseconds and a numeric offset; fromdateiso8601 takes
   # neither, hence the two subs. Read `limits`, not the top-level objects: it is
   # the only place is_active and the per-model buckets appear.
-  printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
+  # jq exits 0 on `empty`, so the status alone does not catch a body without a
+  # session limit (an error payload, say). Callers `set -- $q` under set -u.
+  local q
+  q=$(printf '%s' "$body" | jq -r --argjson now "$(date +%s)" '
       def secs($x): if $x == null or $x.resets_at == null then -1
                     else (($x.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
                            | fromdateiso8601) - $now | floor) end;
@@ -124,7 +127,9 @@ read_quota() {
       | ($l | map(select(.kind == "session")) | first) as $s
       | ($l | map(select(.kind == "weekly_all")) | first) as $w
       | if $s == null then empty
-        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null
+        else "\($s.percent) \(secs($s)) \($w.percent // 0) \(secs($w))" end' 2>/dev/null) || return 1
+  [[ -n "$q" ]] || return 1
+  printf '%s\n' "$q"
 }
 
 # --- the ceiling ------------------------------------------------------------
@@ -290,6 +295,25 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   say "parked: $wt (issue $issue, session $sid)"
 }
 
+# A run that ended on its own and selected nothing leaves a worktree nobody will
+# ever look at; on a queue stalled on human input that is one every wake. "Ended
+# on its own" is classify's `done`, which says the session stopped cleanly, not
+# that any ticket is finished -- a 429 or a brake is `interrupted` and never gets
+# here. Removal is only ever `git worktree remove` without --force, and only with
+# no .env: a worktree that brought up a stack is left for the reaper, which
+# tears it down. Anything that did select is left for the reaper as well.
+tidy() {  # tidy <repo> <worktree>
+  local repo="$1" wt="$2" branch dirty
+  issue_of "$wt" >/dev/null && return
+  dirty=$(git -C "$wt" status --porcelain 2>/dev/null) || return
+  [[ -z "$dirty" && ! -e "$wt/.env" ]] || return
+  [[ -z "$(git -C "$wt" log --oneline HEAD --not --remotes 2>/dev/null)" ]] || return
+  branch=$(git -C "$wt" symbolic-ref --short -q HEAD)
+  git -C "$repo" worktree remove "$wt" 2>/dev/null || return
+  [[ "$branch" == grind/* ]] && git -C "$repo" branch -D "$branch" >/dev/null 2>&1
+  log "tidy removed worktree=$wt branch=$branch nothing selected"
+}
+
 # A parked record whose issue no longer carries the label is ours again.
 # Tab-separated, and the callers read with IFS set to tab: a worktree path can
 # contain spaces, and a blank issue field must stay a field rather than vanish.
@@ -370,6 +394,7 @@ if [[ -n "$active_wt" ]]; then
   if [[ "$verdict" == done ]]; then
     log "done resumed worktree=$active_wt session=$sid"
     state_jq '.active = null'
+    tidy "$repo" "$active_wt"
     say "completed: $active_wt"
   else
     attempts=$((attempts+1))
@@ -432,6 +457,32 @@ if [[ -z "$repo" ]]; then
   exit 0
 fi
 
+# A rough gate, not the selection: GRIND.md decides that, and may still pass on
+# everything counted here (a ticket with an open PR, say). But with no `grind`
+# issue free of needs-human-intervention, and no `grind` pull request waiting on
+# its author, there is certainly nothing to select, and spawning a session every
+# wake to find that out is what drains a stalled queue's windows. A pull request
+# waits on its author when it is labelled changes-requested, has a conflict, or
+# fails a check on its latest commit (GRIND.md item 0). A failed gh call is a
+# refusal, like a failed quota reading.
+open_issues=$(ghq "$repo" issue list --label grind --state open --limit 100 --json labels     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))] | length' 2>/dev/null)
+open_prs=$(ghq "$repo" pr list --label grind --state open --limit 100     --json labels,mergeable,statusCheckRollup     --jq '[.[] | select(all(.labels[]; .name != "needs-human-intervention"))
+               | select(any(.labels[]; .name == "changes-requested")
+                        or .mergeable == "CONFLICTING"
+                        or any(.statusCheckRollup[]?; (.conclusion // .state) as $c
+                               | ["FAILURE","ERROR","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"]
+                               | index($c)))] | length' 2>/dev/null)
+if [[ -z "$open_issues" || -z "$open_prs" ]]; then
+  log "skip could not list grind issues and pull requests in $repo"
+  (( dry_run )) && say "could not list grind issues and pull requests"
+  exit 0
+fi
+if (( open_issues + open_prs == 0 )); then
+  log "idle no open grind issue without needs-human-intervention, no grind pull request to follow up, in $repo"
+  (( dry_run )) && say "nothing eligible: no open grind issue or pull request needing work"
+  exit 0
+fi
+
 ts=$(date +%Y%m%d-%H%M%S)
 wt="$repo/.claude/worktrees/grind-$ts"
 if (( dry_run )); then
@@ -443,6 +494,13 @@ fi
 # tens of commits behind, and a stale base also means a stale reap script in
 # the worktree, which is what decides how its own cleanup behaves.
 git -C "$repo" fetch --quiet origin main 2>/dev/null
+# .grind-item is the engine's file, not the project's, so it is ignored here
+# rather than in each project's .gitignore. info/exclude lives in the common git
+# dir, so this one line covers every worktree of the clone. Untracked, the file
+# made the reaper read a finished worktree as uncommitted work and keep it.
+excl=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude
+grep -qxF /.grind-item "$excl" 2>/dev/null \
+  || { mkdir -p "${excl%/*}" && echo /.grind-item >>"$excl"; }
 if ! git -C "$repo" worktree add -b "grind/$ts" "$wt" origin/main >/dev/null 2>&1; then
   log "error could not create worktree $wt"; say "could not create $wt"; exit 1
 fi
@@ -466,6 +524,7 @@ read -r verdict why < <(classify "$res")
 if [[ "$verdict" == done ]]; then
   log "done worktree=$wt session=$sid"
   state_jq '.active = null'
+  tidy "$repo" "$wt"
   say "completed: $wt"
 else
   state_jq '.active.attempts = 1 | .active.stops = $why' --arg why "$why"

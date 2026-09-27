@@ -225,6 +225,21 @@ a slot against the three-park limit for good while its lock stopped anything
 from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
 is written before any work, so its absence means nothing was selected.
 
+Before starting a fresh item, the grind checks that at least one open `grind`
+issue lacks `needs-human-intervention`, or that a `grind` pull request is
+waiting on its author (`changes-requested`, a conflict, or a failing check). It's a rough gate, not the selection
+-- `GRIND.md` may still pass on everything it counts -- but when it finds none,
+no session is spawned just to discover the queue is empty.
+
+`.grind-item` is added to the clone's `.git/info/exclude` when a worktree is
+made, so a finished worktree reads as clean and the reaper can reclaim it. A
+run that ends on its own having selected nothing has its worktree and
+`grind/<ts>` branch removed outright, provided the tree is clean, holds no
+unpushed commits, and has no `.env` (a stack was brought up; that one is left
+for the reaper to tear down). "Ends on its own" means the session stopped
+cleanly, not that a ticket is finished: a rate-limited or braked run is
+interrupted, and goes to resume and parking instead.
+
 | | |
 |---|---|
 | `claude-rc-grind --status` | Current quota, today's ceilings, active and parked counts |
