@@ -152,6 +152,21 @@ What a restart does cost:
 - A gap of a few seconds for the pre-created session, and until the next
   message for the others.
 
+The one case a restart cannot reach is a server that came up on a *different*
+environment than its sessions are attached to — a deleted or wrong
+`bridge-pointer.json`, or the backend declining reuse (`Bridge env reuse
+mismatch` in the debug log). Those sessions are orphaned until something
+adopts their environment, which a single-session server does:
+
+```sh
+systemd-run --user --unit=claude-rc-adopt-<id> -p Type=exec --working-directory=<the session's directory> \
+  ~/.claude/local/claude remote-control --session-id <id>
+```
+
+Run it from the session's own worktree, or it comes back on the default
+branch. A `claude-rc-recover` script used to wrap this; it was removed once
+plain restarts were verified to cover everything else.
+
 `claude update` replaces the binary on disk, and workers spawned after that
 already run the new version — the server execs children by path. Only the
 server process itself stays old until it is restarted:

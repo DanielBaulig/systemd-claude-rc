@@ -5,7 +5,7 @@
 # title it shows in claude.ai/code and whether anything is serving it.
 #
 # Titles are derived from a session's first prompt, so this is how you turn
-# "the parallel worktree one" into an id you can pass to claude-rc-recover.
+# "the parallel worktree one" into a session id.
 set -uo pipefail
 projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
 
@@ -33,7 +33,7 @@ def first_prompt(d):
                     # Skip tool results, task notifications and other machinery.
                     if not c or c.startswith('<') or c.startswith('['):
                         continue
-                    # Recovering a session compacts its transcript, which
+                    # Resuming a session may compact its transcript, which
                     # replaces the original first prompt with this preamble --
                     # so the title here would stop matching the one in the UI.
                     if c.startswith('This session is being continued'):
@@ -77,8 +77,8 @@ for d in sorted(glob.glob(os.path.expanduser('~/.claude/projects/*bridge-cse-*')
         try: cwd = os.readlink(f'/proc/{pid}/cwd')
         except OSError: cwd = ''
         # Served, but sitting somewhere other than its own worktree: the session
-        # is live yet detached from its work, and recovery will refuse to help
-        # until whatever is serving it is stopped.
+        # is live yet detached from its work. Its own instance, restarted, serves
+        # it in the right place; whatever serves it now has to stop first.
         status = 'SERVED' if (wt and cwd == wt) or not wt else 'MISBOUND'
     elif wt:
         status = 'OFFLINE'
@@ -103,9 +103,9 @@ print(f"{'STATUS':<9} {'SESSION':<30} {'BRANCH':<26} TITLE")
 for status, cse, title, branch, wt in rows:
     print(f"{status:<9} {cse:<30} {branch[:26]:<26} {title}")
 print()
-print("MISBOUND = live but not in its own worktree; stop its server, then claude-rc-recover")
-print("OFFLINE  = worktree exists, nothing serving it; claude-rc-recover <session>")
-print("ARCHIVED = worktree already removed; nothing to recover")
+print("MISBOUND = live but not in its own worktree; stop what serves it, let its own instance take it")
+print("OFFLINE  = worktree exists, nothing serving it; a message from the app re-serves it (README, Restarting an instance)")
+print("ARCHIVED = worktree already removed; nothing to bring back")
 
 # --- environment health -----------------------------------------------------
 # Every server registers an "environment" -- the row you pick in claude.ai/code.
@@ -113,7 +113,7 @@ print("ARCHIVED = worktree already removed; nothing to recover")
 # bridge-pointer.json; a --session-id server adopts the environment of the
 # session it serves. When those coincide, the two servers contend for one
 # environment and the newer registration terminates the older one, so a
-# recovery can silently take a spawner offline (or vice versa).
+# --session-id server can silently take a spawner offline (or vice versa).
 pointers = []
 for f in glob.glob(os.path.expanduser('~/.claude/projects/*/bridge-pointer.json')):
     try: d = json.load(open(f))
