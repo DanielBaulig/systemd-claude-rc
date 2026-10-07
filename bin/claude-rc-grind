@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-rc-grind [--dry-run] [--status] [--hold <hours>] [--release]
+# claude-rc-grind [--dry-run] [--select] [--status] [--hold <hours>] [--release]
 #
 # Spend 5-hour-window quota that would otherwise expire, on one work item from
 # a project's GRIND.md. Runs only in the tail of a window, under a ceiling that
@@ -10,12 +10,22 @@
 # re-do the same thirty turns every window and leak a dirty worktree each time.
 # After MAX_ATTEMPTS it is parked: the worktree is `git worktree lock`ed (a
 # reaper refusal, so reclamation cannot take it) and the issue is labelled for
-# a human. Removing that label hands it back. A run that got far enough to fail
-# but not far enough to write .grind-item is abandoned rather than parked --
-# there is no issue to hand anyone, and nothing was selected, so the worktree
-# holds no work and is left for the reaper.
+# a human. Removing that label hands it back. A job whose work is on no single
+# ticket (triage, say) is abandoned rather than parked -- there is no issue to
+# hand anyone -- and its worktree is left for the reaper.
 #
-# Executes by default; --dry-run decides and prints without spawning.
+# Two sessions per job. A read-only selector reads GRIND.md and the tracker and
+# names the work; an executor does it. The split exists so the executor's
+# opening message can be a slash command: a skill marked
+# disable-model-invocation can only be started by a user turn, and the engine's
+# prompt is one. That turn carries the human's authority, so nothing the
+# selector says reaches it unchecked -- the selector has been reading issue
+# text. Its ticket must be an integer, its passage a verbatim excerpt of
+# GRIND.md, and each skill a /name that passage contains. The engine knows
+# nothing of GRIND.md's shape; it only checks claims against it.
+#
+# Executes by default; --dry-run decides and prints without spawning;
+# --select runs the selector alone, prints what it chose, and starts nothing.
 set -uo pipefail   # not -e: a failed gh/curl is a decision input, not a crash
 
 # --- configuration ----------------------------------------------------------
@@ -49,6 +59,11 @@ MODEL="${GRIND_MODEL:-opus}"
 BRAKE_USD="${GRIND_BRAKE_USD:-20}"   # runaway brake, not a ceiling: the budget
                                      # is checked after a turn completes, so a
                                      # run overshoots it by one full turn
+# Selection is reading and judgement -- whose turn a grilling thread is on, say
+# -- not code, and a wrong pick costs a whole executor run. Hence not haiku.
+SELECT_MODEL="${GRIND_SELECT_MODEL:-sonnet}"
+SELECT_BRAKE_USD="${GRIND_SELECT_BRAKE_USD:-2}"
+PASSAGE_MIN=40       # chars; a passage short enough to match anywhere names nothing
 MAX_ATTEMPTS=3
 MAX_PARKED=3
 PARK_WARN_DAYS=28    # transcripts age out at 30; after that the session id
@@ -72,11 +87,12 @@ dry_run=0; mode=run; hold_hours=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
+    --select)  mode=select; shift ;;
     --status)  mode=status; shift ;;
     --hold)    mode=hold; hold_hours="${2:?--hold needs a number of hours}"; shift 2 ;;
     --release) mode=release; shift ;;
     -h|--help) sed -n '2,6p' "$0" | sed 's/^# \?//'; exit 0 ;;
-    *) echo "usage: claude-rc-grind [--dry-run] [--status] [--hold N] [--release]" >&2; exit 2 ;;
+    *) echo "usage: claude-rc-grind [--dry-run] [--select] [--status] [--hold N] [--release]" >&2; exit 2 ;;
   esac
 done
 
@@ -222,30 +238,158 @@ classify() {  # classify <result-json-file>
 session_id_of() { jget "$1" '.session_id // ""'; }
 
 # --- spawning ---------------------------------------------------------------
-# Returns the result json path on stdout; caller classifies it.
-run_claude() {  # run_claude <worktree> <prompt-file> [resume-session-id]
-  local wt="$1" promptf="$2" resume="${3:-}" out
+# Returns the result json path on stdout; caller classifies it. The appended
+# system prompt is passed on a session's first turn only: the CLI records it
+# then and replays the record on every resume, a human's `claude --resume`
+# included.
+run_claude() {  # run_claude <worktree> <prompt-file> [resume-session-id] [system-file]
+  local wt="$1" promptf="$2" resume="${3:-}" sysf="${4:-}" out
   out=$(mktemp "$STATE_DIR/result.XXXXXX.json")
   local -a args=(-p --output-format json --model "$MODEL"
                  --max-budget-usd "$BRAKE_USD" --permission-mode auto)
   [[ -n "$resume" ]] && args+=(--resume "$resume")
+  [[ -n "$sysf" ]] && args+=(--append-system-prompt "$(cat "$sysf")")
   ( cd "$wt" && "$(claude_bin)" "${args[@]}" <"$promptf" ) >"$out" 2>/dev/null
   printf '%s' "$out"
 }
 
+# --- selecting --------------------------------------------------------------
+SELECT_SCHEMA='{"type":"object","additionalProperties":false,
+  "required":["selected","ticket","skills","passage","reason"],
+  "properties":{"selected":{"type":"boolean"},
+                "ticket":{"type":["integer","null"]},
+                "skills":{"type":"array","items":{"type":"string"}},
+                "passage":{"type":"string"},
+                "reason":{"type":"string"}}}'
+
+# Read-only by construction, not by instruction: it reads untrusted issue text,
+# so it gets no tool that writes. --restricted drops every settings file, whose
+# allow rules would otherwise widen the list below; dontAsk denies the rest.
+run_selector() {  # run_selector <worktree> <grind-md>  -- prints the result json path
+  local wt="$1" doc="$2" out promptf
+  out=$(mktemp "$STATE_DIR/select.XXXXXX.json")
+  promptf=$(mktemp "$STATE_DIR/brief.XXXXXX")
+  {
+    cat <<'BRIEF'
+You are the selector for claude-rc-grind, running unattended with nobody
+watching. Your only job is to decide what the next grind run works on. A
+separate session does the work. You change nothing: no comments, labels,
+edits, commits or files. Use gh to read issues and pull requests (never
+`--watch`), and read files in this repository where GRIND.md calls for it.
+
+The project's GRIND.md follows. Apply its selection rules to the repository's
+current state, exactly as written, and answer with:
+
+- selected: false when nothing GRIND.md describes is eligible right now. That
+  is a normal outcome, not a failure. When false, ticket is null, skills is []
+  and passage is "".
+- ticket: the number of the issue or pull request the work is on, or null when
+  the work is not about any single one.
+- passage: the text of GRIND.md that describes the work you chose, copied
+  verbatim -- the whole item or paragraph, Markdown and all. It is checked
+  character for character against GRIND.md, whitespace aside, and the run is
+  refused if it does not match. Do not paraphrase, abridge or join pieces.
+- skills: every slash-command skill that passage names, in the order the work
+  uses them, by name without the slash -- ["implement", "review"] for a passage
+  that says to load /implement and then run /review. Only names written as
+  /name in the passage; [] when it names none.
+- reason: one or two sentences on why this item and this ticket, for the log.
+
+BRIEF
+    cat "$doc"
+  } >"$promptf"
+  ( cd "$wt" && "$(claude_bin)" -p --output-format json --model "$SELECT_MODEL" \
+      --max-budget-usd "$SELECT_BRAKE_USD" --restricted --permission-mode dontAsk \
+      --tools "Bash,Read,Grep,Glob" \
+      --allowedTools "Bash(gh issue list:*)" "Bash(gh issue view:*)" \
+                     "Bash(gh pr list:*)" "Bash(gh pr view:*)" "Bash(gh pr checks:*)" \
+                     "Bash(jq:*)" Read Grep Glob \
+      --json-schema "$SELECT_SCHEMA" <"$promptf" ) >"$out" 2>/dev/null
+  rm -f "$promptf"
+  printf '%s' "$out"
+}
+
+squash() { tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+
+# Every claim the selector makes is checked against GRIND.md or is an integer;
+# nothing it wrote in its own words survives. Sets sel_ticket (may be empty),
+# sel_passage and sel_skills, and sel_why on any refusal.
+# Returns 0 when selected and sound, 1 when nothing was selected, 2 on refusal.
+vet_selection() {  # vet_selection <select-result-json> <grind-md>
+  local res="$1" doc="$2" verdict why selected s re
+  sel_ticket= sel_passage= sel_skills=() sel_why=
+  read -r verdict why < <(classify "$res")
+  [[ "$verdict" == done ]] || { sel_why="selector $why"; return 2; }
+  selected=$(jget "$res" '.structured_output.selected | if . == null then "missing" else tostring end')
+  [[ "$selected" == false ]] && return 1
+  [[ "$selected" == true ]] || { sel_why="no structured output"; return 2; }
+
+  sel_ticket=$(jget "$res" '.structured_output.ticket // ""')
+  [[ -z "$sel_ticket" || "$sel_ticket" =~ ^[1-9][0-9]{0,8}$ ]] \
+    || { sel_why="ticket is not a number"; return 2; }
+
+  sel_passage=$(jget "$res" '.structured_output.passage // ""' | squash)
+  (( ${#sel_passage} >= PASSAGE_MIN )) || { sel_why="passage under $PASSAGE_MIN chars"; return 2; }
+  squash <"$doc" | grep -qF -- "$sel_passage" \
+    || { sel_why="passage is not an excerpt of $GRIND_DOC"; return 2; }
+
+  while IFS= read -r s; do
+    [[ "$s" =~ ^[a-z0-9][a-z0-9:_-]*$ ]] || { sel_why="skill name '$s' refused"; return 2; }
+    # Bounded so /review does not vouch for /re: the name must end where a
+    # skill name can, and start after something that cannot belong to a path.
+    re="[^A-Za-z0-9_./:-]/${s}([^A-Za-z0-9_:-]|\$)"
+    [[ " $sel_passage " =~ $re ]] || { sel_why="passage does not name /$s"; return 2; }
+    sel_skills+=("$s")
+  done < <(jget "$res" '.structured_output.skills[]?')
+  return 0
+}
+
+# --- executing --------------------------------------------------------------
 # The operating rules are inlined rather than left for the agent to load: they
 # are what keeps an unattended run to one item and off a sleep loop, and a
 # skill the agent never thought to open binds nothing. Frontmatter stripped.
-brief_new() {  # brief_new <grind-md>
-  local f; f=$(mktemp "$STATE_DIR/brief.XXXXXX")
+# Every value but GRIND.md's own text comes from the active record, and every
+# one of those was vetted on the way in.
+brief_system() {  # brief_system <grind-md>
+  local f doc="$1" ticket passage skills
+  ticket=$(jget "$STATE" '.active.ticket // ""')
+  passage=$(jget "$STATE" '.active.passage // ""')
+  skills=$(jget "$STATE" '[.active.steps[]? | select(. != "") | "/" + .] | join(", ")')
+  f=$(mktemp "$STATE_DIR/brief.XXXXXX")
   {
     printf 'You are running unattended under claude-rc-grind, with nobody watching.\n'
-    printf 'How to run as a grind job comes first, then the project brief, %s.\n' "$1"
+    printf 'How to run as a grind job comes first, then the project brief, %s.\n' "$doc"
     printf 'Both are reproduced in full below. Follow them exactly.\n\n'
     awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$GRIND_SKILL"
     printf '\n---\n\n'
-    cat "$1"
+    cat "$doc"
+    printf '\n---\n\n# Your assignment\n\n'
+    printf 'The engine has already selected your work item. Do not select another.\n\n'
+    if [[ -n "$ticket" ]]; then printf 'Ticket: #%s\n\n' "$ticket"
+    else printf 'Ticket: none -- the work is not about a single issue or pull request.\n\n'; fi
+    printf 'The work, as GRIND.md describes it:\n\n%s\n' "$passage"
+    if [[ -n "$skills" ]]; then
+      printf '\nThe engine invokes these skills for you, each as its own turn, in this order: %s.\n' "$skills"
+      printf 'Do not invoke them yourself. In each turn, do the part of the work that\n'
+      printf 'belongs with that skill and whatever GRIND.md puts between it and the next,\n'
+      printf 'then stop; the engine sends the next. Work GRIND.md puts after the last\n'
+      printf 'skill belongs to the last turn. If you stall, the label you add for a\n'
+      printf 'human ends the job: the engine sends nothing further.\n'
+    fi
   } >"$f"
+  printf '%s' "$f"
+}
+
+step_prompt() {  # step_prompt <step-index>
+  local f skill ticket
+  skill=$(jget "$STATE" '.active.steps[$i | tonumber] // ""' --arg i "$1")
+  ticket=$(jget "$STATE" '.active.ticket // ""')
+  f=$(mktemp "$STATE_DIR/brief.XXXXXX")
+  if [[ -n "$skill" ]]; then
+    printf '/%s%s\n' "$skill" "${ticket:+ $ticket}" >"$f"
+  else
+    printf 'Do the work item in your assignment, end to end, then stop.\n' >"$f"
+  fi
   printf '%s' "$f"
 }
 
@@ -261,7 +405,7 @@ BRIEF
 }
 
 # --- parking ----------------------------------------------------------------
-issue_of() {  # the agent writes .grind-item before starting; prose contract in GRIND.md
+issue_of() {  # the engine writes .grind-item from the vetted selection, before the executor starts
   local wt="$1"
   [[ -f "$wt/.grind-item" ]] || return 1
   grep -oE '[0-9]+' "$wt/.grind-item" | head -1
@@ -273,17 +417,15 @@ issue_of() {  # the agent writes .grind-item before starting; prose contract in 
 # skip a record whose issue is empty. Parking one anyway would hold a MAX_PARKED
 # slot nothing could ever release, and the lock -- which gotaspot's reaper reads
 # as a refusal (scripts/reap-worktrees.sh, is_locked) -- would strand the
-# directory on disk for good. So a run with no .grind-item is abandoned, not
-# parked. GRIND.md has the agent write that file as soon as it selects, before
-# it touches anything, so the absence of it means nothing was selected and the
-# worktree holds no work to lose.
+# directory on disk for good. So a job with no .grind-item -- one whose work is
+# on no single ticket -- is abandoned, not parked, and left for the reaper.
 park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   local wt="$1" sid="$2" repo="$3" attempts="$4" stops="$5" issue
   issue=$(issue_of "$wt") || issue=
   if [[ -z "$issue" ]]; then
     state_jq '.active = null'
     log "abandon worktree=$wt session=$sid attempts=$attempts stops=$stops no .grind-item"
-    say "abandoned: $wt (no .grind-item -- nothing was selected; left for the reaper)"
+    say "abandoned: $wt (no ticket to hand a human; left for the reaper)"
     return
   fi
   git -C "$repo" worktree lock --reason \
@@ -304,13 +446,14 @@ park() {  # park <worktree> <session_id> <repo> <attempts> <stops>
   say "parked: $wt (issue $issue, session $sid)"
 }
 
-# A run that ended on its own and selected nothing leaves a worktree nobody will
-# ever look at; on a queue stalled on human input that is one every wake. "Ended
-# on its own" is classify's `done`, which says the session stopped cleanly, not
-# that any ticket is finished -- a 429 or a brake is `interrupted` and never gets
-# here. Removal is only ever `git worktree remove` without --force, and only with
-# no .env: a worktree that brought up a stack is left for the reaper, which
-# tears it down. Anything that did select is left for the reaper as well.
+# A worktree with no ticket and nothing in it is one nobody will ever look at:
+# a selection that came back empty or refused leaves one every wake on a queue
+# stalled on human input, and so does a ticketless job that finished. Callers
+# reach this only when a session stopped on its own -- a 429 or a brake is
+# `interrupted` and goes to resume instead. Removal is only ever `git worktree
+# remove` without --force, and only with no .env: a worktree that brought up a
+# stack is left for the reaper, which tears it down. Anything with a ticket is
+# left for the reaper as well.
 tidy() {  # tidy <repo> <worktree>
   local repo="$1" wt="$2" branch dirty
   issue_of "$wt" >/dev/null && return
@@ -320,7 +463,77 @@ tidy() {  # tidy <repo> <worktree>
   branch=$(git -C "$wt" symbolic-ref --short -q HEAD)
   git -C "$repo" worktree remove "$wt" 2>/dev/null || return
   [[ "$branch" == grind/* ]] && git -C "$repo" branch -D "$branch" >/dev/null 2>&1
-  log "tidy removed worktree=$wt branch=$branch nothing selected"
+  log "tidy removed worktree=$wt branch=$branch no ticket, nothing left in it"
+}
+
+# --- the active job's turns ---------------------------------------------------
+# A job is a list of steps: one per skill the selection named, or a single ""
+# for work that names none. Each step is a user turn on one session -- the first
+# starts it, the rest resume it -- since a skill only a user may start cannot be
+# reached from inside another. next_step is bumped before its turn launches, so
+# an interrupted step is finished by a resume turn, never re-issued.
+
+interrupted() {  # interrupted <why>  -- count the stop; park past MAX_ATTEMPTS
+  local why="$1" wt sid repo attempts stops
+  wt=$(jget "$STATE" '.active.worktree // ""')
+  sid=$(jget "$STATE" '.active.session_id // ""')
+  repo=$(jget "$STATE" '.active.repo // ""')
+  attempts=$(( $(jget "$STATE" '.active.attempts // 0') + 1 ))
+  stops=$(jget "$STATE" '.active.stops // ""'); stops="${stops:+$stops,}$why"
+  if (( attempts > MAX_ATTEMPTS )); then
+    park "$wt" "$sid" "$repo" "$attempts" "$stops"
+  else
+    state_jq '.active.attempts = ($att | tonumber) | .active.stops = $stops' \
+      --arg att "$attempts" --arg stops "$stops"
+    log "interrupted $why worktree=$wt session=$sid attempts=$attempts"
+    say "interrupted ($why); will resume"
+  fi
+}
+
+turn() {  # turn <prompt-file>  -- 0 when the session stopped on its own
+  local promptf="$1" wt sid sysf= res verdict why
+  wt=$(jget "$STATE" '.active.worktree // ""')
+  sid=$(jget "$STATE" '.active.session_id // ""')
+  [[ -z "$sid" ]] && sysf=$(brief_system "$wt/$GRIND_DOC")
+  res=$(run_claude "$wt" "$promptf" "$sid" "$sysf"); [[ -n "$sysf" ]] && rm -f "$sysf"
+  if [[ -z "$sid" ]]; then
+    sid=$(session_id_of "$res")
+    [[ -n "$sid" ]] && state_jq '.active.session_id = $sid' --arg sid "$sid"
+  fi
+  read -r verdict why < <(classify "$res"); rm -f "$res"
+  [[ "$verdict" == done ]] && return 0
+  interrupted "$why"; return 1
+}
+
+# A turn that stalled -- labelled its ticket for a human and stopped -- ended on
+# its own as far as classify can tell; the label is the only sign. Sending the
+# next skill into it would carry on past a question nobody has answered yet.
+stalled() {
+  local repo ticket
+  repo=$(jget "$STATE" '.active.repo // ""'); ticket=$(jget "$STATE" '.active.ticket // ""')
+  [[ -n "$ticket" ]] || return 1
+  ghq "$repo" issue view "$ticket" --json labels --jq '.labels[].name' 2>/dev/null \
+    | grep -qx needs-human-intervention
+}
+
+drive() {  # run the active job's remaining steps; record how it ends
+  local n step pf wt repo
+  n=$(jget "$STATE" '.active.steps | length')
+  while step=$(jget "$STATE" '.active.next_step // 0'); (( step < n )); do
+    if (( step > 0 )) && stalled; then
+      log "stalled before step $step worktree=$(jget "$STATE" '.active.worktree // ""')"
+      break
+    fi
+    state_jq '.active.next_step += 1'
+    pf=$(step_prompt "$step")
+    turn "$pf" || { rm -f "$pf"; return; }
+    rm -f "$pf"
+  done
+  wt=$(jget "$STATE" '.active.worktree // ""'); repo=$(jget "$STATE" '.active.repo // ""')
+  log "done worktree=$wt session=$(jget "$STATE" '.active.session_id // ""') steps=$n"
+  state_jq '.active = null'
+  tidy "$repo" "$wt"
+  say "completed: $wt"
 }
 
 # A parked record whose issue no longer carries the label is ours again.
@@ -332,6 +545,45 @@ parked_ready_index() {
             (.value.session_id // ""), (.value.repo // "")] | @tsv' "$STATE" 2>/dev/null
 }
 
+# --- a fresh worktree, and what to do in it ----------------------------------
+new_worktree() {  # new_worktree <repo> <worktree> <ts>
+  local repo="$1" wt="$2" ts="$3" excl
+  # Branch from a freshly fetched origin/main: the local main on this host runs
+  # tens of commits behind, and a stale base also means a stale reap script in
+  # the worktree, which is what decides how its own cleanup behaves.
+  git -C "$repo" fetch --quiet origin main 2>/dev/null
+  # .grind-item is the engine's file, not the project's, so it is ignored here
+  # rather than in each project's .gitignore. info/exclude lives in the common git
+  # dir, so this one line covers every worktree of the clone. Untracked, the file
+  # made the reaper read a finished worktree as uncommitted work and keep it.
+  excl=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude
+  grep -qxF /.grind-item "$excl" 2>/dev/null \
+    || { mkdir -p "${excl%/*}" && echo /.grind-item >>"$excl"; }
+  if ! git -C "$repo" worktree add -b "grind/$ts" "$wt" origin/main >/dev/null 2>&1; then
+    log "error could not create worktree $wt"; return 1
+  fi
+  # The one gitignored file Claude Code itself copies into a worktree it makes.
+  # Never .env or apps/web/.dev.vars: those carry a port-block claim and a
+  # path-derived compose project name, and setup:worktree generates them.
+  [[ -f "$repo/.claude/settings.local.json" ]] \
+    && cp "$repo/.claude/settings.local.json" "$wt/.claude/settings.local.json" 2>/dev/null
+  return 0
+}
+
+# Selection runs before any job is recorded: a selector that fails, finds
+# nothing or is refused leaves no .active behind, so it costs no attempt and
+# the next wake simply asks again. GRIND.md is the worktree's own copy, so it
+# always matches the base the work is done on rather than whatever the shared
+# checkout happens to have. Returns as vet_selection does.
+select_into() {  # select_into <repo> <worktree>
+  local repo="$1" wt="$2" res rc
+  res=$(run_selector "$wt" "$wt/$GRIND_DOC")
+  vet_selection "$res" "$wt/$GRIND_DOC"; rc=$?
+  log "select repo=$repo rc=$rc ticket=${sel_ticket:-none} skills=${sel_skills[*]:-none} reason=$(jget "$res" '.structured_output.reason // "" | gsub("\\s+"; " ")')"
+  rm -f "$res"
+  return "$rc"
+}
+
 # --- subcommands ------------------------------------------------------------
 case "$mode" in
   hold)
@@ -339,6 +591,25 @@ case "$mode" in
     say "holding until $(date -d "+$hold_hours hours" '+%F %H:%M')"; exit 0 ;;
   release)
     rm -f "$HOLD"; say "hold released"; exit 0 ;;
+  select)
+    # Costs a selector run, so it is opt-in; skips the quota gates and touches
+    # no job state, but takes the lock so it cannot race a wake for the tree.
+    exec 9>"$LOCKFILE"
+    flock -n 9 || { say "a wake holds the lock; try again shortly"; exit 1; }
+    repo=$(grind_projects | head -1)
+    [[ -n "$repo" ]] || { say "no project has a $GRIND_DOC"; exit 0; }
+    ts=select-$(date +%Y%m%d-%H%M%S); wt="$repo/.claude/worktrees/grind-$ts"
+    new_worktree "$repo" "$wt" "$ts" || { say "could not create $wt"; exit 1; }
+    select_into "$repo" "$wt"; rc=$?
+    case $rc in
+      0) say "ticket:  ${sel_ticket:-none}"
+         say "steps:   ${sel_skills[*]:-(no skill)}"
+         say "passage: $sel_passage" ;;
+      1) say "nothing eligible" ;;
+      *) say "refused: $sel_why" ;;
+    esac
+    tidy "$repo" "$wt"
+    exit 0 ;;
   status)
     if q=$(read_quota); then
       set -- $q
@@ -398,27 +669,17 @@ if [[ -n "$active_wt" ]]; then
   repo=$(jget "$STATE" '.active.repo // ""')
   attempts=$(jget "$STATE" '.active.attempts // 0')
   if (( dry_run )); then say "would resume $active_wt (session $sid, attempt $((attempts+1)))"; exit 0; fi
-  bf=$(brief_resume); res=$(run_claude "$active_wt" "$bf" "$sid"); rm -f "$bf"
-  read -r verdict why < <(classify "$res")
-  if [[ "$verdict" == done ]]; then
-    log "done resumed worktree=$active_wt session=$sid"
-    state_jq '.active = null'
-    tidy "$repo" "$active_wt"
-    say "completed: $active_wt"
+  # A record from before steps existed ran its whole job in one turn.
+  state_jq '.active.steps //= [""] | .active.next_step //= 1'
+  if [[ -z "$sid" ]]; then
+    # No session came back, so no step got as far as a transcript: issue the
+    # interrupted one again rather than resume nothing.
+    state_jq '.active.next_step = ([.active.next_step - 1, 0] | max)'
+    drive
   else
-    attempts=$((attempts+1))
-    stops=$(jget "$STATE" '.active.stops // ""')
-    stops="${stops:+$stops,}$why"
-    if (( attempts > MAX_ATTEMPTS )); then
-      park "$active_wt" "$sid" "$repo" "$attempts" "$stops"
-    else
-      state_jq '.active.attempts = ($att | tonumber) | .active.stops = $stops' \
-        --arg att "$attempts" --arg stops "$stops"
-      log "interrupted $why worktree=$active_wt attempts=$attempts"
-      say "interrupted ($why); will resume"
-    fi
+    bf=$(brief_resume); turn "$bf" && drive; rm -f "$bf"
   fi
-  rm -f "$res"; exit 0
+  exit 0
 fi
 
 # 2. A parked job whose label has been removed is ours again.
@@ -516,45 +777,26 @@ if (( dry_run )); then
   exit 0
 fi
 
-# Branch from a freshly fetched origin/main: the local main on this host runs
-# tens of commits behind, and a stale base also means a stale reap script in
-# the worktree, which is what decides how its own cleanup behaves.
-git -C "$repo" fetch --quiet origin main 2>/dev/null
-# .grind-item is the engine's file, not the project's, so it is ignored here
-# rather than in each project's .gitignore. info/exclude lives in the common git
-# dir, so this one line covers every worktree of the clone. Untracked, the file
-# made the reaper read a finished worktree as uncommitted work and keep it.
-excl=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude
-grep -qxF /.grind-item "$excl" 2>/dev/null \
-  || { mkdir -p "${excl%/*}" && echo /.grind-item >>"$excl"; }
-if ! git -C "$repo" worktree add -b "grind/$ts" "$wt" origin/main >/dev/null 2>&1; then
-  log "error could not create worktree $wt"; say "could not create $wt"; exit 1
-fi
-# The one gitignored file Claude Code itself copies into a worktree it makes.
-# Never .env or apps/web/.dev.vars: those carry a port-block claim and a
-# path-derived compose project name, and setup:worktree generates them.
-[[ -f "$repo/.claude/settings.local.json" ]] \
-  && cp "$repo/.claude/settings.local.json" "$wt/.claude/settings.local.json" 2>/dev/null
+new_worktree "$repo" "$wt" "$ts" || { say "could not create $wt"; exit 1; }
+select_into "$repo" "$wt"; rc=$?
+case $rc in
+  1) log "idle selector found nothing eligible in $repo"
+     tidy "$repo" "$wt"; exit 0 ;;
+  2) log "refuse selection in $repo: $sel_why"
+     say "selection refused: $sel_why"
+     tidy "$repo" "$wt"; exit 0 ;;
+esac
 
+# Everything recorded here was vetted by vet_selection; brief_system and
+# step_prompt build the executor's turns from this record alone.
+steps='[""]'
+(( ${#sel_skills[@]} )) && steps=$(printf '%s\n' "${sel_skills[@]}" | jq -R . | jq -sc .)
+[[ -n "$sel_ticket" ]] && printf '%s\n' "$sel_ticket" >"$wt/.grind-item"
 state_jq '.active = {worktree: $wt, repo: $repo, session_id: "", attempts: 0,
-                     stops: "", started_at: $now}' \
-  --arg wt "$wt" --arg repo "$repo" --arg now "$(date -Is)"
-log "start repo=$repo worktree=$wt"
-
-# The brief is the worktree's own copy, so it always matches the base the work
-# is done on rather than whatever the shared checkout happens to have.
-bf=$(brief_new "$wt/$GRIND_DOC"); res=$(run_claude "$wt" "$bf"); rm -f "$bf"
-sid=$(session_id_of "$res")
-[[ -n "$sid" ]] && state_jq '.active.session_id = $sid' --arg sid "$sid"
-read -r verdict why < <(classify "$res")
-if [[ "$verdict" == done ]]; then
-  log "done worktree=$wt session=$sid"
-  state_jq '.active = null'
-  tidy "$repo" "$wt"
-  say "completed: $wt"
-else
-  state_jq '.active.attempts = 1 | .active.stops = $why' --arg why "$why"
-  log "interrupted $why worktree=$wt session=$sid attempts=1"
-  say "interrupted ($why); will resume"
-fi
-rm -f "$res"
+                     stops: "", started_at: $now,
+                     ticket: $ticket, passage: $passage,
+                     steps: $steps, next_step: 0}' \
+  --arg wt "$wt" --arg repo "$repo" --arg now "$(date -Is)" \
+  --arg ticket "$sel_ticket" --arg passage "$sel_passage" --argjson steps "$steps"
+log "start repo=$repo worktree=$wt ticket=${sel_ticket:-none} steps=${sel_skills[*]:-none}"
+drive

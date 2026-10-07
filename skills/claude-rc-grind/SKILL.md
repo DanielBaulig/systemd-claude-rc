@@ -10,30 +10,36 @@ budget is genuinely spare, and starts you in a fresh worktree with nobody
 watching. The project's `GRIND.md` says what is worth working on. This says
 how to work within the grind, in any project.
 
-## One item, end to end, then stop
+## The work is already chosen
 
-Pick exactly one work item from `GRIND.md`, take it end to end, and stop. Do not
-start a second. Whether more work happens is decided by the next wake, which
-re-reads the budget and selects again from scratch — it is not your decision
-to make.
+A separate, read-only selector session has already applied `GRIND.md` to the
+tracker and picked your work item. The engine appends it to your instructions
+as your assignment: the ticket, and the passage of `GRIND.md` that describes
+the work. Do that item, end to end, and stop. Do not select another, and do
+not start a second. Whether more work happens is decided by the next wake,
+which re-reads the budget and selects again from scratch — it is not your
+decision to make.
 
-If nothing in `GRIND.md` matches, say so and stop without doing anything. An
-empty queue is a normal outcome, not a failure.
+If the assigned work turns out to be already done, or no longer eligible under
+`GRIND.md`, say so and stop without doing anything. That is a normal outcome,
+not a failure.
 
-## Write `.grind-item` as soon as you select
+The engine writes `.grind-item` itself, from the selection. Leave it alone.
 
-Write the number of the issue or pull request you selected to `.grind-item` at
-the worktree root, before you touch anything else. If the run is interrupted
-and later has to be handed to a human, that file is the only way the engine
-knows which ticket to comment on and label; it cannot read it out of your
-prose. It is git-ignored, and nothing reads it after a run that finishes.
+## Skills are started for you
+
+When the passage names skills — `/implement`, `/review` — the engine sends
+each one to you as its own turn, in order, the way a user would type it. Some
+of them can only be started that way. Do not try to invoke them yourself. In
+each turn, do the part of the work that belongs with that skill and whatever
+`GRIND.md` puts between it and the next, then stop; the engine sends the next.
 
 ## You can be cut off at any point
 
 The quota window closes without warning, possibly mid-command. An interrupted
 run is resumed on a later wake; a run that fails repeatedly is parked for a
-human. Either way the next session re-selects from the ticket's state, not
-from your intentions, so:
+human. Either way, a later selection reads the ticket's state, not your
+intentions, so:
 
 - **A selection precondition must stay true until the work it gates is done.**
   Removing a label before doing the work it stands for silently drops that
@@ -56,7 +62,8 @@ If you stall, or hit a decision that is genuinely a human's to make: label the
 ticket `needs-human-intervention`, comment saying precisely what you need, and
 stop. Do not guess, and do not substitute easier work for the work you were
 doing. Stopping cleanly is a good outcome; the session is kept, and a human can
-resume it with your full context intact.
+resume it with your full context intact. That label also ends the job: the
+engine sends no further skills after it.
 
 ## Do not edit the brief you are running under
 
