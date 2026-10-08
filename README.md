@@ -277,22 +277,56 @@ restarted. After three failed attempts it is parked — the worktree is
 issue is labelled `needs-human-intervention` with a `claude --resume` command
 in a comment. Removing that label hands it back.
 
-Parking needs an issue number, which the agent writes to `.grind-item` as soon
-as it selects. A run that fails before that point is **abandoned** instead:
-`.active` is cleared, the worktree is left unlocked for the reaper, and a line
-goes in the log. Every handle on a parked record is its issue number — the
-unpark check, the transcript-age warning, the comment carrying the resume
-command — so a record without one could never be handed back, and would hold
-a slot against the three-park limit for good while its lock stopped anything
-from reclaiming the directory. Nothing is lost by dropping it: `.grind-item`
-is written before any work, so its absence means nothing was selected.
+Parking needs an issue number, which the engine writes to `.grind-item` from
+the selection. A job whose work is on no single ticket -- triage, say -- has
+none, and is **abandoned** instead: `.active` is cleared, the worktree is left
+unlocked for the reaper, and a line goes in the log. Every handle on a parked
+record is its issue number — the unpark check, the transcript-age warning, the
+comment carrying the resume command — so a record without one could never be
+handed back, and would hold a slot against the three-park limit for good while
+its lock stopped anything from reclaiming the directory.
 
-A run's prompt is two documents: the `claude-rc-grind` skill
-(`skills/claude-rc-grind/SKILL.md`), which says how to run as a grind job in
-any project — one item then stop, write `.grind-item`, expect to be cut off,
-stall rather than guess, leave checking back to the engine — and the project's
-`GRIND.md`, which says only what is worth working on there. The skill is
-inlined, not left for the agent to load, and a run refuses to start without it.
+### Selector and executor
+
+A fresh item takes two sessions. A **selector** (`GRIND_SELECT_MODEL`, Sonnet
+by default, $2 brake) reads `GRIND.md` and the tracker and answers in
+structured output: the ticket, the passage of `GRIND.md` that describes the
+work, and the skills that passage names. It runs `--restricted` with
+`dontAsk` and only `gh issue/pr list/view`, `gh pr checks`, `jq` and the file
+readers allowed, so it cannot write anything. An **executor** (`GRIND_MODEL`)
+then does the work.
+
+The split exists for skills marked `disable-model-invocation`, such as
+`/implement` and `/triage`: an agent cannot load them, only a user turn can,
+and the engine's prompt is a user turn. So the executor's opening prompt is
+`/<skill> <ticket>`, and each further skill the passage names is sent as its
+own turn on the same session (`--resume`), unless the ticket has picked up
+`needs-human-intervention` in between, which ends the job.
+
+That user turn carries your authority, and the selector has been reading
+issue text, so nothing it says reaches the executor unchecked. The engine
+knows nothing about `GRIND.md`'s layout; it checks each claim against it:
+
+- the ticket must be an integer (or null, for ticketless work);
+- the passage must be a verbatim excerpt of `GRIND.md`, whitespace aside, of
+  at least 40 characters;
+- each skill must be written as `/<name>` inside that passage.
+
+A selection that fails any check is logged and refused, and nothing is
+started. A selector that fails, finds nothing or is refused leaves no
+`.active` behind and costs no attempt; the next wake asks again. Its reasoning
+goes in the log either way. `claude-rc-grind --select` runs the selector alone
+and prints what it chose, without starting anything.
+
+The executor's prompt is the opening slash command (or a fixed "do your
+assignment" line when no skill is named). Its rules arrive as an appended
+system prompt: the `claude-rc-grind` skill (`skills/claude-rc-grind/SKILL.md`),
+which says how to run as a grind job in any project — do the assigned item
+then stop, expect to be cut off, stall rather than guess, leave checking back
+to the engine — then the project's `GRIND.md`, then the vetted assignment.
+The skill is inlined, not left for the agent to load, and a run refuses to
+start without it. The CLI records that system prompt on the first turn and
+replays it on every resume, a human's `claude --resume` included.
 
 Before starting a fresh item, the grind checks that some `grind` issue or pull
 request has work waiting: an issue without `needs-human-intervention` carrying a
@@ -305,7 +339,8 @@ no session is spawned just to discover the queue is empty.
 
 `.grind-item` is added to the clone's `.git/info/exclude` when a worktree is
 made, so a finished worktree reads as clean and the reaper can reclaim it. A
-run that ends on its own having selected nothing has its worktree and
+selection that comes back empty or refused, or a ticketless job that ends on
+its own, has its worktree and
 `grind/<ts>` branch removed outright, provided the tree is clean, holds no
 unpushed commits, and has no `.env` (a stack was brought up; that one is left
 for the reaper to tear down). "Ends on its own" means the session stopped
@@ -316,6 +351,7 @@ interrupted, and goes to resume and parking instead.
 |---|---|
 | `claude-rc-grind --status` | Current quota, today's ceilings, active and parked counts |
 | `claude-rc-grind --dry-run` | Decide and print, spawn nothing |
+| `claude-rc-grind --select` | Run the selector alone and print its vetted choice; ignores the quota gates, starts nothing |
 | `claude-rc-grind --hold 4` | Stand down for four hours, then resume on its own |
 | `claude-rc-grind --release` | Cancel a hold |
 
