@@ -47,6 +47,14 @@ intentions, so:
 - **Prefer the order that fails visibly.** Where two writes must both land,
   do first the one whose lonely presence a human would spot as wrong.
 
+## Your turn ending ends the session
+
+You run headless: when your turn ends, the process exits, and anything still
+running in the background dies with it. Background tasks are switched off for
+that reason. Run every command — test suites, e2e, CI watches — in the
+foreground, and finish what it reports before you stop. Never end a turn with
+"I'll do X once this passes": nothing will come back to do X.
+
 ## Stopping is the job of the engine, not a sleep loop
 
 A session ends when you stop. Nothing brings it back later, so do not wait for

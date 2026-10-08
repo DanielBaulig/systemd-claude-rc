@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-rc-grind [--dry-run] [--select] [--status] [--hold <hours>] [--release]
+# claude-rc-grind [--dry-run] [--select] [--now] [--status] [--hold <hours>] [--release]
 #
 # Spend 5-hour-window quota that would otherwise expire, on one work item from
 # a project's GRIND.md. Runs only in the tail of a window, under a ceiling that
@@ -25,7 +25,8 @@
 # nothing of GRIND.md's shape; it only checks claims against it.
 #
 # Executes by default; --dry-run decides and prints without spawning;
-# --select runs the selector alone, prints what it chose, and starts nothing.
+# --select runs the selector alone, prints what it chose, and starts nothing;
+# --now is one attended wake that ignores a hold and the quota gates.
 set -uo pipefail   # not -e: a failed gh/curl is a decision input, not a crash
 
 # --- configuration ----------------------------------------------------------
@@ -83,16 +84,17 @@ projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
 USAGE_URL=https://api.anthropic.com/api/oauth/usage
 
 # --- argument handling ------------------------------------------------------
-dry_run=0; mode=run; hold_hours=
+dry_run=0; now=0; mode=run; hold_hours=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
     --select)  mode=select; shift ;;
+    --now)     now=1; shift ;;
     --status)  mode=status; shift ;;
     --hold)    mode=hold; hold_hours="${2:?--hold needs a number of hours}"; shift 2 ;;
     --release) mode=release; shift ;;
     -h|--help) sed -n '2,6p' "$0" | sed 's/^# \?//'; exit 0 ;;
-    *) echo "usage: claude-rc-grind [--dry-run] [--select] [--status] [--hold N] [--release]" >&2; exit 2 ;;
+    *) echo "usage: claude-rc-grind [--dry-run] [--select] [--now] [--status] [--hold N] [--release]" >&2; exit 2 ;;
   esac
 done
 
@@ -238,6 +240,12 @@ classify() {  # classify <result-json-file>
 session_id_of() { jget "$1" '.session_id // ""'; }
 
 # --- spawning ---------------------------------------------------------------
+# A headless session exits when its turn ends, background tasks or not. Left
+# on, the agent backgrounds a long test run and ends its turn to wait for it:
+# the run dies, classify sees a clean stop, and the job is recorded done with
+# its last fixes uncommitted. Observed 2026-10-07 on gotaspot #447.
+export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
+
 # Returns the result json path on stdout; caller classifies it. The appended
 # system prompt is passed on a session's first turn only: the CLI records it
 # then and replays the record on every resume, a human's `claude --resume`
@@ -276,6 +284,12 @@ watching. Your only job is to decide what the next grind run works on. A
 separate session does the work. You change nothing: no comments, labels,
 edits, commits or files. Use gh to read issues and pull requests (never
 `--watch`), and read files in this repository where GRIND.md calls for it.
+
+Decide eligibility by GRIND.md's rules only -- labels, linked pull requests,
+thread state, whatever it names. Whether the work can actually be done
+(tooling, skills, permissions, an earlier run's failure on the ticket) is the
+executor's problem, not yours: do not investigate it, and do not skip an
+eligible ticket over it. Keep it brief; this is a lookup, not a review.
 
 The project's GRIND.md follows. Apply its selection rules to the repository's
 current state, exactly as written, and answer with:
@@ -630,7 +644,7 @@ esac
 exec 9>"$LOCKFILE"
 flock -n 9 || { log "skip another instance holds the lock"; exit 0; }
 
-if [[ -f "$HOLD" ]] && (( $(cat "$HOLD" 2>/dev/null || echo 0) > $(date +%s) )); then
+if (( now == 0 )) && [[ -f "$HOLD" ]] && (( $(cat "$HOLD" 2>/dev/null || echo 0) > $(date +%s) )); then
   log "skip hold until $(date -d "@$(cat "$HOLD")" -Is)"; exit 0
 fi
 
@@ -653,7 +667,9 @@ week_ceil=$(weekly_ceiling "$week_left")
 # different things. Both must pass.
 log "wake session=${sess_pct}%/${sess_ceil}% weekly=${week_pct}%/${week_ceil}% mins_left=$(( sess_left / 60 )) work=$(in_work_hours && echo y || echo n)"
 
-if (( sess_pct >= sess_ceil )) || (( week_pct >= week_ceil )); then
+if (( now )); then
+  log "now: gates waived for an attended wake"
+elif (( sess_pct >= sess_ceil )) || (( week_pct >= week_ceil )); then
   reason="session ${sess_pct}% vs ${sess_ceil}%"
   (( week_pct >= week_ceil )) && reason="weekly ${week_pct}% vs ${week_ceil}%"
   log "hold $reason"
