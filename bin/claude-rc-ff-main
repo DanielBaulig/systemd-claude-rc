@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# claude-rc-ff-main <name>
+#
+# Keep a project's main checkout current with its remote default branch.
+# Hooks and scripts that run from the main checkout (gotaspot's SessionEnd
+# worktree reaper, say) only pick up fixes merged on GitHub once something
+# pulls them here; in October 2026 gotaspot's sat 99 commits behind.
+#
+# Fast-forward only. Acts only when the checkout is on its default branch with
+# no commits of its own; never resets, stashes, checks out or touches a
+# worktree. A local change in the way of the update makes the merge refuse on
+# its own, and the next run tries again.
+set -uo pipefail
+
+name="${1:?usage: claude-rc-ff-main <name>}"
+projects_dir="${CLAUDE_RC_PROJECTS_DIR:-$HOME/projects}"
+dir="$projects_dir/$name"
+
+g() { git -C "$dir" "$@"; }
+
+g rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || { echo "$name: not a git checkout: $dir" >&2; exit 1; }
+
+# The remote's own idea of its default branch, falling back to main.
+default=$(g symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)
+default=${default#origin/}; default=${default:-main}
+
+branch=$(g symbolic-ref --short -q HEAD)
+[[ "$branch" == "$default" ]] \
+  || { echo "$name: on ${branch:-a detached HEAD}, not $default; skipping"; exit 0; }
+
+# Never block on a credential prompt; a unit has no one to answer it.
+export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+timeout 120 git -C "$dir" fetch -q origin "$default" \
+  || { echo "$name: fetch of origin/$default failed" >&2; exit 1; }
+
+ahead=$(g rev-list --count "origin/$default..HEAD")
+behind=$(g rev-list --count "HEAD..origin/$default")
+(( ahead > 0 )) && { echo "$name: $ahead local commit(s) on $default; skipping"; exit 0; }
+(( behind == 0 )) && exit 0
+
+if g merge -q --ff-only "origin/$default" 2>/dev/null; then
+  echo "$name: fast-forwarded $default by $behind commit(s) to $(g rev-parse --short HEAD)"
+else
+  echo "$name: $behind commit(s) behind, but a local change is in the way; skipping"
+fi
