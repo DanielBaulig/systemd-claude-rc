@@ -16,7 +16,7 @@ UNITS     := $(notdir $(wildcard $(REPO)/units/*))
 SKILLS     := $(notdir $(wildcard $(REPO)/skills/*))
 SKILL_DIR  := $(PROJECTS_DIR)/.claude/skills
 
-.PHONY: help install uninstall enable disable enable-general disable-general check status link relink
+.PHONY: help install uninstall enable disable enable-general disable-general enable-ff disable-ff check status link relink
 
 help:
 	@echo "claude-rc -- systemd-supervised 'claude rc' Remote Control servers"
@@ -26,6 +26,8 @@ help:
 	@echo "  make disable NAME=foo  Stop and disable that instance"
 	@echo "  make enable-general    Enable and start the instance for the projects root itself"
 	@echo "  make disable-general   Stop and disable it"
+	@echo "  make enable-ff NAME=foo   Keep \$$PROJECTS_DIR/foo's main checkout fast-forwarded"
+	@echo "  make disable-ff NAME=foo  Stop doing that"
 	@echo "  make status            Show the target, the timers and every instance"
 	@echo "  make check             Preflight: projects dir, claude, linger"
 	@echo "  make uninstall         Remove symlinks (leaves ~/projects and the repo alone)"
@@ -98,6 +100,15 @@ enable-general:
 
 disable-general:
 	systemctl --user disable --now claude-rc-general.service
+
+enable-ff:
+	@[[ -n "$(NAME)" ]] || { echo "usage: make enable-ff NAME=<project>" >&2; exit 1; }
+	@[[ -d "$(PROJECTS_DIR)/$(NAME)" ]] || { echo "no such project: $(PROJECTS_DIR)/$(NAME)" >&2; exit 1; }
+	systemctl --user enable --now "claude-rc-ff-main@$(NAME).timer"
+
+disable-ff:
+	@[[ -n "$(NAME)" ]] || { echo "usage: make disable-ff NAME=<project>" >&2; exit 1; }
+	systemctl --user disable --now "claude-rc-ff-main@$(NAME).timer"
 
 check:
 	@fail=0; \

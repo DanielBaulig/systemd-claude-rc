@@ -61,6 +61,8 @@ Two things it can't do for you:
 | `make disable NAME=<project>` | Stop + disable it |
 | `make enable-general` | Enable + start the instance for the projects root itself |
 | `make disable-general` | Stop + disable it |
+| `make enable-ff NAME=<project>` | Keep that project's main checkout fast-forwarded ([below](#keeping-main-checkouts-current)) |
+| `make disable-ff NAME=<project>` | Stop doing that |
 | `make status` | The target, the timer, and every instance |
 | `make check` | Preflight: projects dir, claude, linger |
 | `make relink` | Refresh symlinks and `daemon-reload` (after a `git pull`) |
@@ -232,6 +234,28 @@ script here is editing the deployed one. Skills land in the projects root rather
 than in any one repository so that the `general` instance, which serves that
 root, picks them up as project scope. After changing a unit file, run
 `make relink`.
+
+### Keeping main checkouts current
+
+Sessions work in worktrees and merge through GitHub, so nothing ever pulls
+into a project's main checkout. Anything that runs *from* that checkout — a
+hook script, say — stays at whatever version was there when someone last
+pulled by hand. In October 2026 gotaspot's SessionEnd worktree reaper ran from
+a main checkout 99 commits behind, so fixes to the reaper merged on GitHub did
+nothing on this host.
+
+`claude-rc-ff-main@<name>.timer` runs `claude-rc-ff-main <name>` every 15
+minutes: fetch the remote's default branch and `merge --ff-only` it, but only
+when the checkout is on that branch with no commits of its own. It never
+resets, stashes or checks anything out. A local change in the way makes the
+merge refuse, which it logs, and the next run tries again. It's opt-in per
+project, since it changes files under any session working directly in the main
+checkout:
+
+```sh
+make enable-ff NAME=<project>
+journalctl --user -u 'claude-rc-ff-main@<project>.service'   # one line per run that did something
+```
 
 ## Grind
 

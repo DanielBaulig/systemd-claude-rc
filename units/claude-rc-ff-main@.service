@@ -1,0 +1,10 @@
+[Unit]
+Description=Fast-forward the main checkout of %i to its remote default branch
+PartOf=claude-rc.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-rc-ff-main %i
+# A fetch should never compete with a running agent.
+Nice=19
+IOSchedulingClass=idle
